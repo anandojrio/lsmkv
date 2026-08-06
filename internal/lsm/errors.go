@@ -8,4 +8,5 @@ var (
 	ErrIOFailure          = errors.New("io failure")
 	ErrCorruptionDetected = errors.New("corruption detected")
 	ErrNotImplemented     = errors.New("not implemented")
+	ErrNotFound           = errors.New("not found")
 )
