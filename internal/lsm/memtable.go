@@ -1,5 +1,7 @@
 package lsm
 
+import "sort"
+
 type memtableEntry struct {
 	value     []byte
 	seqNo     uint64
@@ -57,4 +59,23 @@ func (m *Memtable) Len() int {
 
 func (m *Memtable) Bytes() int64 {
 	return m.bytes
+}
+
+// AllEntries returns every entry in the memtable as sstEntry values,
+// sorted by key. Used by the flush path to hand a complete, sorted
+// snapshot to SSTableWriter.
+func (m *Memtable) AllEntries() []sstEntry {
+	entries := make([]sstEntry, 0, len(m.entries))
+	for k, e := range m.entries {
+		entries = append(entries, sstEntry{
+			key:       []byte(k),
+			value:     e.value,
+			seqNo:     e.seqNo,
+			tombstone: e.tombstone,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return string(entries[i].key) < string(entries[j].key)
+	})
+	return entries
 }

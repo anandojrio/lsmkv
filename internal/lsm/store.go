@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 )
 
 type Store struct {
@@ -11,10 +12,14 @@ type Store struct {
 	closed bool
 	stats  Stats
 
-	wal     *WAL
-	mem     *Memtable
-	seqNo   uint64
-	version *Version
+	mu sync.RWMutex
+
+	wal        *WAL
+	mem        *Memtable
+	immutables []*Memtable
+	seqNo      uint64
+	version    *Version
+	manifest   *Manifest
 }
 
 func Open(cfg Config) (*Store, error) {
@@ -23,10 +28,6 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
-	// Open a reader for every table the manifest claims is live. If any
-	// one of them fails to open, close everything opened so far and
-	// refuse to start rather than run in a degraded state with a gap in
-	// the table set.
 	readers := make([]*SSTableReader, 0, len(manifest.Tables))
 	for _, t := range manifest.Tables {
 		r, err := OpenSSTableReader(filepath.Join(cfg.DataDir, t.File))
@@ -71,11 +72,13 @@ func Open(cfg Config) (*Store, error) {
 	}
 
 	store := &Store{
-		cfg:     cfg,
-		wal:     wal,
-		mem:     mem,
-		seqNo:   maxSeq,
-		version: version,
+		cfg:        cfg,
+		wal:        wal,
+		mem:        mem,
+		immutables: nil,
+		seqNo:      maxSeq,
+		version:    version,
+		manifest:   manifest,
 		stats: Stats{
 			EngineStatus: "open",
 		},
@@ -85,45 +88,39 @@ func Open(cfg Config) (*Store, error) {
 }
 
 func (s *Store) Put(key, value []byte) error {
-	if s.closed {
-		return ErrStoreClosed
-	}
-
 	if len(key) == 0 {
 		return ErrInvalidArgument
 	}
 
-	s.seqNo++
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	rec := WALRecord{
-		Op:    WALOpPut,
-		SeqNo: s.seqNo,
-		Key:   key,
-		Value: value,
+	if s.closed {
+		return ErrStoreClosed
 	}
 
+	s.seqNo++
+
+	rec := WALRecord{Op: WALOpPut, SeqNo: s.seqNo, Key: key, Value: value}
 	if err := s.wal.Append(rec); err != nil {
 		return err
 	}
 
 	s.mem.Put(key, value, s.seqNo)
 
-	return nil
+	return s.rotateAndFlushIfNeededLocked()
 }
 
-// Get returns the latest visible value for key. It checks the active
-// memtable first; on a miss there, it falls through to the SSTables held
-// by the store's current Version, searched newest-to-oldest. A tombstone
-// hit at any layer stops the search immediately and reports "not found",
-// since a tombstone means the key was deleted after whatever older value
-// might still exist on disk.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
-	if s.closed {
-		return nil, false, ErrStoreClosed
-	}
-
 	if len(key) == 0 {
 		return nil, false, ErrInvalidArgument
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, false, ErrStoreClosed
 	}
 
 	if value, tombstone, found := s.mem.Get(key); found {
@@ -131,6 +128,15 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 			return nil, false, nil
 		}
 		return value, true, nil
+	}
+
+	for i := len(s.immutables) - 1; i >= 0; i-- {
+		if value, tombstone, found := s.immutables[i].Get(key); found {
+			if tombstone {
+				return nil, false, nil
+			}
+			return value, true, nil
+		}
 	}
 
 	entry, err := s.version.Get(key)
@@ -149,42 +155,125 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 }
 
 func (s *Store) Delete(key []byte) error {
-	if s.closed {
-		return ErrStoreClosed
-	}
-
 	if len(key) == 0 {
 		return ErrInvalidArgument
 	}
 
-	s.seqNo++
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	rec := WALRecord{
-		Op:    WALOpDel,
-		SeqNo: s.seqNo,
-		Key:   key,
+	if s.closed {
+		return ErrStoreClosed
 	}
 
+	s.seqNo++
+
+	rec := WALRecord{Op: WALOpDel, SeqNo: s.seqNo, Key: key}
 	if err := s.wal.Append(rec); err != nil {
 		return err
 	}
 
 	s.mem.Delete(key, s.seqNo)
 
+	return s.rotateAndFlushIfNeededLocked()
+}
+
+func (s *Store) rotateAndFlushIfNeededLocked() error {
+	if s.mem.Bytes() < int64(s.cfg.MemtableMaxBytes) {
+		return nil
+	}
+
+	s.immutables = append(s.immutables, s.mem)
+	s.mem = newMemtable()
+
+	return s.flushOldestImmutableLocked()
+}
+
+func (s *Store) flushOldestImmutableLocked() error {
+	if len(s.immutables) == 0 {
+		return nil
+	}
+
+	imm := s.immutables[0]
+	entries := imm.AllEntries()
+	if len(entries) == 0 {
+		s.immutables = s.immutables[1:]
+		return nil
+	}
+
+	id := s.manifest.nextTableID()
+	filename := fmt.Sprintf("%06d.sst", id)
+	path := filepath.Join(s.cfg.DataDir, filename)
+
+	w := NewSSTableWriter(s.cfg)
+	for _, e := range entries {
+		w.Add(e.key, e.value, e.seqNo, e.tombstone)
+	}
+
+	if err := w.Flush(path); err != nil {
+		return fmt.Errorf("flush immutable to sstable: %w", err)
+	}
+
+	minKey, maxKey := entries[0].key, entries[len(entries)-1].key
+	minSeq, maxSeq := entries[0].seqNo, entries[0].seqNo
+	for _, e := range entries[1:] {
+		if e.seqNo < minSeq {
+			minSeq = e.seqNo
+		}
+		if e.seqNo > maxSeq {
+			maxSeq = e.seqNo
+		}
+	}
+
+	info := ManifestTable{
+		ID:       id,
+		File:     filename,
+		MinKey:   string(minKey),
+		MaxKey:   string(maxKey),
+		MinSeqNo: minSeq,
+		MaxSeqNo: maxSeq,
+	}
+
+	newManifest := s.manifest.withNewTable(info)
+	if err := saveManifest(s.cfg, newManifest); err != nil {
+		return fmt.Errorf("save manifest after flush: %w", err)
+	}
+
+	reader, err := OpenSSTableReader(path)
+	if err != nil {
+		return fmt.Errorf("open freshly flushed sstable: %w", err)
+	}
+
+	s.version = s.version.withPublishedFlush(reader, newManifest.Epoch)
+	s.manifest = newManifest
+	s.immutables = s.immutables[1:]
+
 	return nil
 }
 
 func (s *Store) Stats() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	s.stats.BytesWritten = s.wal.BytesWritten()
 	s.stats.LastSeqNo = s.seqNo
 	s.stats.ActiveEntries = s.mem.Len()
 	s.stats.ActiveBytes = s.mem.Bytes()
 	s.stats.SSTCount = len(s.version.SSTables)
 
+	s.stats.ImmutablesCount = len(s.immutables)
+	s.stats.ImmutablesBytes = 0
+	for _, imm := range s.immutables {
+		s.stats.ImmutablesBytes += imm.Bytes()
+	}
+
 	return s.stats
 }
 
 func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.closed {
 		return ErrStoreClosed
 	}

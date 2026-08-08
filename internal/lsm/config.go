@@ -10,6 +10,7 @@ import (
 type Config struct {
 	DataDir            string  `json:"data_dir"`
 	MemtableMaxBytes   int     `json:"memtable_max_bytes"`
+	MaxImmutableTables int     `json:"max_immutable_tables"`
 	BlockSize          int     `json:"block_size"`
 	BloomFalsePositive float64 `json:"bloom_false_positive"`
 	WALFsyncEveryN     int     `json:"wal_fsync_every_n"`
@@ -21,6 +22,7 @@ func DefaultConfig() Config {
 	return Config{
 		DataDir:            "./data",
 		MemtableMaxBytes:   67108864,
+		MaxImmutableTables: 2,
 		BlockSize:          8192,
 		BloomFalsePositive: 0.01,
 		WALFsyncEveryN:     1,
@@ -81,6 +83,10 @@ func (c Config) Validate() error {
 
 	if c.WALFsyncEveryN <= 0 {
 		return fmt.Errorf("%w: wal_fsync_every_n must be > 0", ErrInvalidArgument)
+	}
+
+	if c.MaxImmutableTables < 1 {
+		return fmt.Errorf("max immutable tables must be at least 1: %w", ErrInvalidArgument)
 	}
 
 	switch c.Compression {

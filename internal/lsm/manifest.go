@@ -73,3 +73,29 @@ func saveManifest(cfg Config, m *Manifest) error {
 
 	return nil
 }
+
+// withNewTable returns a copy of the manifest with t prepended (newest
+// first) and the epoch incremented. The original manifest is not mutated.
+func (m *Manifest) withNewTable(t ManifestTable) *Manifest {
+	tables := make([]ManifestTable, 0, len(m.Tables)+1)
+	tables = append(tables, t)
+	tables = append(tables, m.Tables...)
+
+	return &Manifest{
+		Version: m.Version,
+		Epoch:   m.Epoch + 1,
+		Tables:  tables,
+	}
+}
+
+// nextTableID returns the next unused table id, based on the highest id
+// currently recorded in the manifest.
+func (m *Manifest) nextTableID() uint64 {
+	var max uint64
+	for _, t := range m.Tables {
+		if t.ID > max {
+			max = t.ID
+		}
+	}
+	return max + 1
+}

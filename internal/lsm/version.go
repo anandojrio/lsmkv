@@ -60,3 +60,18 @@ func (v *Version) Close() error {
 	}
 	return nil
 }
+
+// withPublishedFlush returns a new Version with newReader prepended (newest
+// first) and the epoch bumped to newEpoch. The original Version and its
+// readers are left untouched — callers are responsible for closing the old
+// Version's readers list minus the ones still referenced, if ever needed.
+func (v *Version) withPublishedFlush(newReader *SSTableReader, newEpoch uint64) *Version {
+	tables := make([]*SSTableReader, 0, len(v.SSTables)+1)
+	tables = append(tables, newReader)
+	tables = append(tables, v.SSTables...)
+
+	return &Version{
+		Epoch:    newEpoch,
+		SSTables: tables,
+	}
+}
