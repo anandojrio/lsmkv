@@ -47,7 +47,18 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
 	bloomOffset := binary.LittleEndian.Uint64(footer[8:16])
 
-	// 3. Read BLOOM FILTER bytes (from bloomOffset to start of footer).
+	// 3. Validate footer offsets.
+	if int64(indexOffset) < 0 || int64(bloomOffset) < 0 {
+		return nil, fmt.Errorf("negative offsets in sst footer: %w", ErrCorruptionDetected)
+	}
+	if int64(indexOffset) > size-16 || int64(bloomOffset) > size-16 {
+		return nil, fmt.Errorf("footer offsets out of bounds: %w", ErrCorruptionDetected)
+	}
+	if indexOffset > bloomOffset {
+		return nil, fmt.Errorf("invalid footer offsets order: %w", ErrCorruptionDetected)
+	}
+
+	// 4. Read BLOOM FILTER bytes (from bloomOffset to start of footer).
 	bloomSize := (size - 16) - int64(bloomOffset)
 	if bloomSize < 0 {
 		return nil, fmt.Errorf("invalid bloom offset in sst: %w", ErrCorruptionDetected)
@@ -61,7 +72,7 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 		return nil, fmt.Errorf("unmarshal sst bloom: %w", err)
 	}
 
-	// 4. Read INDEX BLOCK bytes (from indexOffset to bloomOffset).
+	// 5. Read INDEX BLOCK bytes (from indexOffset to bloomOffset).
 	indexSize := int64(bloomOffset) - int64(indexOffset)
 	if indexSize < 0 {
 		return nil, fmt.Errorf("invalid index offset in sst: %w", ErrCorruptionDetected)
@@ -116,6 +127,64 @@ func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 	return scanBlock(blockBytes, key)
 }
 
+// AllEntries returns every entry stored in this SSTable in ascending key order.
+//
+// Compaction uses this method to read complete SSTables before merging them.
+// Tombstones are intentionally returned too: a tombstone is a real record that
+// must participate in newest-write-wins merge logic.
+func (r *SSTableReader) AllEntries() ([]sstEntry, error) {
+	if len(r.index) == 0 {
+		return nil, nil
+	}
+
+	f, err := os.Open(r.path)
+	if err != nil {
+		return nil, fmt.Errorf("open sstable for full scan: %w", err)
+	}
+	defer f.Close()
+
+	var out []sstEntry
+
+	for i := 0; i < len(r.index); i++ {
+		blockStart := int64(r.index[i].byteOffset)
+
+		var blockEnd int64
+		if i+1 < len(r.index) {
+			blockEnd = int64(r.index[i+1].byteOffset)
+		} else {
+			blockEnd = r.indexOffset
+		}
+
+		if blockStart < 0 || blockEnd < blockStart {
+			return nil, fmt.Errorf("invalid sstable block range: %w", ErrCorruptionDetected)
+		}
+
+		blockSize := blockEnd - blockStart
+		if blockSize == 0 {
+			continue
+		}
+
+		block := make([]byte, blockSize)
+		if _, err := f.ReadAt(block, blockStart); err != nil {
+			return nil, fmt.Errorf("read sstable block: %w", err)
+		}
+
+		br := bufio.NewReader(newByteReader(block))
+		for {
+			entry, err := readSSEntry(br)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, entry)
+		}
+	}
+
+	return out, nil
+}
+
 // Close releases resources held by the reader. It is currently a no-op
 // because the reader opens and closes the underlying file per Get call
 // rather than holding a long-lived descriptor. It exists so call sites
@@ -133,17 +202,12 @@ func (r *SSTableReader) locateBlock(key []byte) (start int64, end int64) {
 		return -1, -1
 	}
 
-	// Find the last index entry whose firstKey <= key using sort.Search.
-	// sort.Search finds the smallest i where f(i) is true.
-	// We want the last i where index[i].firstKey <= key.
 	n := len(r.index)
 	pos := sort.Search(n, func(i int) bool {
 		return string(r.index[i].firstKey) > string(key)
 	})
-	// pos is the first index where firstKey > key.
-	// So pos-1 is the last index where firstKey <= key.
+
 	if pos == 0 {
-		// All index entries have firstKey > key — key is before the first block.
 		return -1, -1
 	}
 	blockIdx := pos - 1
@@ -153,7 +217,6 @@ func (r *SSTableReader) locateBlock(key []byte) (start int64, end int64) {
 	if blockIdx+1 < n {
 		blockEnd = int64(r.index[blockIdx+1].byteOffset)
 	} else {
-		// Last block ends at the start of the index.
 		blockEnd = r.indexOffset
 	}
 

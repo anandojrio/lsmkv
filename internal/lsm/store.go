@@ -3,6 +3,7 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 )
@@ -183,6 +184,10 @@ func (s *Store) rotateAndFlushIfNeededLocked() error {
 		return nil
 	}
 
+	if s.cfg.MaxImmutableTables > 0 && len(s.immutables) >= s.cfg.MaxImmutableTables {
+		return ErrTooManyImmutables
+	}
+
 	s.immutables = append(s.immutables, s.mem)
 	s.mem = newMemtable()
 
@@ -214,6 +219,11 @@ func (s *Store) flushOldestImmutableLocked() error {
 		return fmt.Errorf("flush immutable to sstable: %w", err)
 	}
 
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat flushed sstable: %w", err)
+	}
+
 	minKey, maxKey := entries[0].key, entries[len(entries)-1].key
 	minSeq, maxSeq := entries[0].seqNo, entries[0].seqNo
 	for _, e := range entries[1:] {
@@ -232,6 +242,7 @@ func (s *Store) flushOldestImmutableLocked() error {
 		MaxKey:   string(maxKey),
 		MinSeqNo: minSeq,
 		MaxSeqNo: maxSeq,
+		FileSize: fi.Size(),
 	}
 
 	newManifest := s.manifest.withNewTable(info)
@@ -248,6 +259,78 @@ func (s *Store) flushOldestImmutableLocked() error {
 	s.manifest = newManifest
 	s.immutables = s.immutables[1:]
 
+	if err := s.wal.Reset(); err != nil {
+		return fmt.Errorf("reset wal after flush: %w", err)
+	}
+
+	return nil
+}
+
+// Compact runs at most one size-tiered compaction cycle: it merges the two
+// oldest SSTables in the current manifest into one, publishes the resulting
+// manifest, and rebuilds the store's Version so future reads see the merged
+// table instead of the two originals.
+//
+// It is a no-op (returns nil) if fewer than two SSTables currently exist.
+func (s *Store) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	nextManifest, err := runCompactionOnce(s.cfg, s.manifest)
+	if err != nil {
+		return err
+	}
+
+	if nextManifest == s.manifest {
+		return nil
+	}
+
+	readers := make([]*SSTableReader, 0, len(nextManifest.Tables))
+	for _, table := range nextManifest.Tables {
+		reader, err := OpenSSTableReader(filepath.Join(s.cfg.DataDir, table.File))
+		if err != nil {
+			for _, opened := range readers {
+				opened.Close()
+			}
+			return fmt.Errorf("reopen sstables after compaction: %w", err)
+		}
+		readers = append(readers, reader)
+	}
+
+	oldVersion := s.version
+	s.version = newVersionFromManifest(nextManifest, readers)
+	s.manifest = nextManifest
+
+	if oldVersion != nil {
+		oldVersion.Close()
+	}
+
+	return nil
+}
+
+// FlushAll writes every queued immutable memtable to an SSTable.
+//
+// It is intentionally synchronous for now. Later, the background flush worker
+// will use the same internal flush routine, while this method remains useful
+// for tests, explicit shutdown handling, and a future CLI command.
+func (s *Store) FlushAll() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	for len(s.immutables) > 0 {
+		if err := s.flushOldestImmutableLocked(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -260,6 +343,12 @@ func (s *Store) Stats() Stats {
 	s.stats.ActiveEntries = s.mem.Len()
 	s.stats.ActiveBytes = s.mem.Bytes()
 	s.stats.SSTCount = len(s.version.SSTables)
+
+	var sstTotalBytes int64
+	for _, t := range s.manifest.Tables {
+		sstTotalBytes += t.FileSize
+	}
+	s.stats.SSTTotalBytes = sstTotalBytes
 
 	s.stats.ImmutablesCount = len(s.immutables)
 	s.stats.ImmutablesBytes = 0

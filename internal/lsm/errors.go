@@ -9,4 +9,5 @@ var (
 	ErrCorruptionDetected = errors.New("corruption detected")
 	ErrNotImplemented     = errors.New("not implemented")
 	ErrNotFound           = errors.New("not found")
+	ErrTooManyImmutables  = errors.New("too many immutable memtables, write rejected")
 )

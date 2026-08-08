@@ -75,6 +75,36 @@ func (w *WAL) Append(record WALRecord) error {
 	return nil
 }
 
+// Reset truncates the WAL to zero bytes and resets the write position to
+// the beginning of the file. Called after a successful memtable flush so
+// that WAL records for the now-persisted data are removed.
+func (w *WAL) Reset() error {
+	if w.file == nil {
+		return ErrStoreClosed
+	}
+
+	path := w.path
+
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("close wal before reset: %w", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("reopen wal after truncate: %w", err)
+	}
+
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync wal after reset: %w", err)
+	}
+
+	w.file = file
+	w.appendCount = 0
+	w.bytesWritten = 0
+	return nil
+}
+
 func (w *WAL) Path() string {
 	return w.path
 }
