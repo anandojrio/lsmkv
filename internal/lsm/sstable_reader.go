@@ -116,6 +116,15 @@ func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 	return scanBlock(blockBytes, key)
 }
 
+// Close releases resources held by the reader. It is currently a no-op
+// because the reader opens and closes the underlying file per Get call
+// rather than holding a long-lived descriptor. It exists so call sites
+// (e.g. Version.Close) are forward-compatible if a future change
+// introduces a persistent handle or memory-mapped file.
+func (r *SSTableReader) Close() error {
+	return nil
+}
+
 // locateBlock binary-searches the index for the last entry whose firstKey ≤ key.
 // Returns the byte offset of the block start and the byte offset of its end.
 // Returns -1, -1 if no block could contain the key.
@@ -145,23 +154,7 @@ func (r *SSTableReader) locateBlock(key []byte) (start int64, end int64) {
 		blockEnd = int64(r.index[blockIdx+1].byteOffset)
 	} else {
 		// Last block ends at the start of the index.
-		blockEnd = int64(r.index[0].byteOffset)
-		// Wait — index[0].byteOffset is the START of the first block.
-		// The last data block ends where the index begins.
-		// We stored indexOffset in the footer. We need it here.
-		// Instead, derive it: last index entry's byteOffset is the start of the
-		// last block; its end is the indexOffset, which equals r.index[0].byteOffset
-		// only if there's one block. For the general case we read from the footer.
-		// Since we don't store indexOffset in SSTableReader, use the first
-		// index entry's byteOffset as the limit only for single-block files,
-		// and otherwise use the next entry. For the multi-block case this branch
-		// handles only the final block — its end is the total index start.
-		// We can recompute: open the file just enough to re-read the footer.
-		if blockIdx+1 < n {
-			blockEnd = int64(r.index[blockIdx+1].byteOffset)
-		} else {
-			blockEnd = r.indexOffset
-		}
+		blockEnd = r.indexOffset
 	}
 
 	return blockStart, blockEnd
