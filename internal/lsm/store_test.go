@@ -296,14 +296,17 @@ func TestWALFileExistsAfterWrite(t *testing.T) {
 	cfg := testConfig(t)
 	store, err := Open(cfg)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("open: %v", err)
 	}
-	_ = store.Put([]byte("k"), []byte("v"))
-	_ = store.Close()
+	defer store.Close()
 
-	walPath := filepath.Join(cfg.DataDir, "wal.log")
-	if _, err := os.Stat(walPath); os.IsNotExist(err) {
-		t.Fatal("expected wal.log to exist after write")
+	if err := store.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	walPath := filepath.Join(cfg.DataDir, "wal", "000001.wal")
+	if _, err := os.Stat(walPath); err != nil {
+		t.Fatalf("expected %s to exist after write: %v", walPath, err)
 	}
 }
 

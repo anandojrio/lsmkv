@@ -1,46 +1,137 @@
 package lsm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+const (
+	walDirectoryName = "wal"
+
+	// Segment header:
+	// magic (4 bytes) + version (1 byte) + reserved (3 bytes).
+	walSegmentMagic      uint32 = 0x4C534D57 // bytes: "WMSL" on disk in little-endian; identity only
+	walSegmentVersion    byte   = 1
+	walSegmentHeaderSize        = 8
 )
 
 type WAL struct {
+	dir          string
 	path         string
 	file         *os.File
 	fsyncEveryN  int
+	rollBytes    int64
 	appendCount  int
 	bytesWritten int64
+	activeID     int
+	activeSize   int64
 	lastSeqNo    uint64
 }
 
+func walDirectory(dataDir string) string {
+	return filepath.Join(dataDir, walDirectoryName)
+}
+
+func walSegmentPath(dir string, id int) string {
+	return filepath.Join(dir, fmt.Sprintf("%06d.wal", id))
+}
+
 func OpenWAL(cfg Config) (*WAL, error) {
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create data dir: %w", err)
+	dir := walDirectory(cfg.DataDir)
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create wal directory: %w", err)
 	}
 
-	path := filepath.Join(cfg.DataDir, "wal.log")
-
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	ids, err := listWALSegmentIDs(dir)
 	if err != nil {
-		return nil, fmt.Errorf("open wal: %w", err)
+		return nil, err
+	}
+
+	wal := &WAL{
+		dir:         dir,
+		fsyncEveryN: cfg.WALFsyncEveryN,
+		rollBytes:   int64(cfg.WALSegmentRollBytes),
+	}
+
+	if len(ids) == 0 {
+		if err := wal.openNewSegment(1); err != nil {
+			return nil, err
+		}
+		return wal, nil
+	}
+
+	if err := wal.openExistingSegment(ids[len(ids)-1]); err != nil {
+		return nil, err
+	}
+
+	return wal, nil
+}
+
+func (w *WAL) openNewSegment(id int) error {
+	path := walSegmentPath(w.dir, id)
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("create wal segment %s: %w", path, err)
+	}
+
+	header := make([]byte, walSegmentHeaderSize)
+	binary.LittleEndian.PutUint32(header[0:4], walSegmentMagic)
+	header[4] = walSegmentVersion
+
+	if _, err := file.Write(header); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write wal segment header: %w", err)
+	}
+
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync wal segment header: %w", err)
+	}
+
+	w.file = file
+	w.path = path
+	w.activeID = id
+	w.activeSize = walSegmentHeaderSize
+	w.bytesWritten = 0
+	w.appendCount = 0
+
+	return nil
+}
+
+func (w *WAL) openExistingSegment(id int) error {
+	path := walSegmentPath(w.dir, id)
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open wal segment %s: %w", path, err)
 	}
 
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("stat wal: %w", err)
+		return fmt.Errorf("stat wal segment: %w", err)
 	}
 
-	wal := &WAL{
-		path:         path,
-		file:         file,
-		fsyncEveryN:  cfg.WALFsyncEveryN,
-		bytesWritten: info.Size(),
+	if info.Size() < walSegmentHeaderSize {
+		_ = file.Close()
+		return fmt.Errorf("%w: wal segment %s is smaller than header", ErrCorruptionDetected, path)
 	}
 
-	return wal, nil
+	w.file = file
+	w.path = path
+	w.activeID = id
+	w.activeSize = info.Size()
+	w.bytesWritten = info.Size() - walSegmentHeaderSize
+	w.appendCount = 0
+
+	return nil
 }
 
 func (w *WAL) Append(record WALRecord) error {
@@ -51,6 +142,14 @@ func (w *WAL) Append(record WALRecord) error {
 	encoded, err := record.Encode()
 	if err != nil {
 		return err
+	}
+
+	// Roll before appending if the current segment already has records and
+	// adding this record would exceed the configured size threshold.
+	if w.bytesWritten > 0 && w.activeSize+int64(len(encoded)) > w.rollBytes {
+		if err := w.roll(); err != nil {
+			return err
+		}
 	}
 
 	n, err := w.file.Write(encoded)
@@ -64,6 +163,7 @@ func (w *WAL) Append(record WALRecord) error {
 
 	w.appendCount++
 	w.bytesWritten += int64(n)
+	w.activeSize += int64(n)
 	w.lastSeqNo = record.SeqNo
 
 	if w.fsyncEveryN > 0 && w.appendCount%w.fsyncEveryN == 0 {
@@ -75,38 +175,68 @@ func (w *WAL) Append(record WALRecord) error {
 	return nil
 }
 
-// Reset truncates the WAL to zero bytes and resets the write position to
-// the beginning of the file. Called after a successful memtable flush so
-// that WAL records for the now-persisted data are removed.
+func (w *WAL) roll() error {
+	if w.file == nil {
+		return ErrStoreClosed
+	}
+
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("sync wal before roll: %w", err)
+	}
+
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("close wal before roll: %w", err)
+	}
+
+	w.file = nil
+
+	if err := w.openNewSegment(w.activeID + 1); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Reset is called only after a successful memtable-to-SSTable flush.
+// At that point, all mutations represented in the WAL are already durable
+// in the newly published SSTable and manifest, so all existing WAL segments
+// can be removed safely.
 func (w *WAL) Reset() error {
 	if w.file == nil {
 		return ErrStoreClosed
 	}
 
-	path := w.path
-
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("close wal before reset: %w", err)
 	}
+	w.file = nil
 
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC|os.O_APPEND, 0o644)
+	ids, err := listWALSegmentIDs(w.dir)
 	if err != nil {
-		return fmt.Errorf("reopen wal after truncate: %w", err)
+		return err
 	}
 
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("sync wal after reset: %w", err)
+	for _, id := range ids {
+		path := walSegmentPath(w.dir, id)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove wal segment %s: %w", path, err)
+		}
 	}
 
-	w.file = file
-	w.appendCount = 0
-	w.bytesWritten = 0
+	if err := w.openNewSegment(1); err != nil {
+		return err
+	}
+
+	w.lastSeqNo = 0
 	return nil
 }
 
 func (w *WAL) Path() string {
 	return w.path
+}
+
+func (w *WAL) Dir() string {
+	return w.dir
 }
 
 func (w *WAL) BytesWritten() int64 {
@@ -117,16 +247,69 @@ func (w *WAL) LastSeqNo() uint64 {
 	return w.lastSeqNo
 }
 
+func (w *WAL) ActiveSegmentID() int {
+	return w.activeID
+}
+
+func (w *WAL) TotalSegments() int {
+	ids, err := listWALSegmentIDs(w.dir)
+	if err != nil {
+		return 0
+	}
+	return len(ids)
+}
+
 func (w *WAL) Close() error {
 	if w.file == nil {
 		return ErrStoreClosed
 	}
 
+	if err := w.file.Sync(); err != nil {
+		_ = w.file.Close()
+		w.file = nil
+		return fmt.Errorf("sync wal on close: %w", err)
+	}
+
 	err := w.file.Close()
 	w.file = nil
+
 	if err != nil {
 		return fmt.Errorf("close wal: %w", err)
 	}
 
 	return nil
+}
+
+func listWALSegmentIDs(dir string) ([]int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list wal directory: %w", err)
+	}
+
+	ids := make([]int, 0)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".wal") {
+			continue
+		}
+
+		idText := strings.TrimSuffix(name, ".wal")
+		id, err := strconv.Atoi(idText)
+		if err != nil || id <= 0 {
+			continue
+		}
+
+		ids = append(ids, id)
+	}
+
+	sort.Ints(ids)
+	return ids, nil
 }

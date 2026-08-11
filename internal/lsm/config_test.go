@@ -210,3 +210,12 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		t.Fatal("expected invalid config values to be rejected")
 	}
 }
+
+func TestConfigRejectsNonPositiveWALSegmentRollBytes(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WALSegmentRollBytes = 0
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for zero wal_segment_roll_bytes")
+	}
+}

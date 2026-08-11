@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"testing"
+	"time"
 )
 
 func tinyMemtableConfig(t *testing.T) Config {
@@ -11,29 +12,65 @@ func tinyMemtableConfig(t *testing.T) Config {
 	return cfg
 }
 
-func TestPutTriggersFlushAndPublishesSSTable(t *testing.T) {
-	cfg := tinyMemtableConfig(t)
+// waitForFlush waits until background flush has drained all immutables
+// and published at least wantSST SSTables, or fails the test on timeout.
+func waitForFlush(t *testing.T, s *Store, wantSST int) {
+	t.Helper()
 
-	store, err := Open(cfg)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := s.Stats()
+		if st.ImmutablesCount == 0 && st.SSTCount >= wantSST {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	st := s.Stats()
+	t.Fatalf(
+		"timed out waiting for flush: immutables=%d sst=%d want_sst>=%d status=%s",
+		st.ImmutablesCount,
+		st.SSTCount,
+		wantSST,
+		st.EngineStatus,
+	)
+}
+
+func TestPutTriggersFlushAndPublishesSSTable(t *testing.T) {
+	cfg := testConfig(t)
+	// Tiny memtable so one Put rotates immediately.
+	cfg.MemtableMaxBytes = 1
+
+	s, err := Open(cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer store.Close()
+	defer s.Close()
 
-	if err := store.Put([]byte("alpha"), []byte("one")); err != nil {
+	if err := s.Put([]byte("k"), []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	if len(store.immutables) != 0 {
-		t.Fatalf("expected no pending immutables after successful flush, got %d", len(store.immutables))
+	// Flush is background now — wait instead of asserting instantly.
+	waitForFlush(t, s, 1)
+
+	st := s.Stats()
+	if st.ImmutablesCount != 0 {
+		t.Fatalf("expected no pending immutables after successful flush, got %d", st.ImmutablesCount)
+	}
+	if st.SSTCount != 1 {
+		t.Fatalf("expected SSTCount=1, got %d", st.SSTCount)
 	}
 
-	if len(store.version.SSTables) != 1 {
-		t.Fatalf("expected 1 sstable in version, got %d", len(store.version.SSTables))
+	got, found, err := s.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
 	}
-
-	if len(store.manifest.Tables) != 1 {
-		t.Fatalf("expected 1 table in manifest, got %d", len(store.manifest.Tables))
+	if !found {
+		t.Fatalf("expected key present after flush")
+	}
+	if string(got) != "v" {
+		t.Fatalf("got %q, want %q", got, "v")
 	}
 }
 
@@ -122,23 +159,29 @@ func TestReopenLoadsFlushedSSTable(t *testing.T) {
 }
 
 func TestStatsReflectFlushedTable(t *testing.T) {
-	cfg := tinyMemtableConfig(t)
+	cfg := testConfig(t)
+	cfg.MemtableMaxBytes = 1
 
-	store, err := Open(cfg)
+	s, err := Open(cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer store.Close()
+	defer s.Close()
 
-	if err := store.Put([]byte("stats-key"), []byte("stats-value")); err != nil {
+	if err := s.Put([]byte("stats-key"), []byte("stats-val")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	stats := store.Stats()
-	if stats.SSTCount != 1 {
-		t.Fatalf("expected SSTCount=1, got %d", stats.SSTCount)
+	waitForFlush(t, s, 1)
+
+	st := s.Stats()
+	if st.SSTCount != 1 {
+		t.Fatalf("expected SSTCount=1, got %d", st.SSTCount)
 	}
-	if stats.ImmutablesCount != 0 {
-		t.Fatalf("expected ImmutablesCount=0 after synchronous flush, got %d", stats.ImmutablesCount)
+	if st.SSTTotalBytes <= 0 {
+		t.Fatalf("expected SSTTotalBytes > 0, got %d", st.SSTTotalBytes)
+	}
+	if st.ImmutablesCount != 0 {
+		t.Fatalf("expected ImmutablesCount=0, got %d", st.ImmutablesCount)
 	}
 }
