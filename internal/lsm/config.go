@@ -8,30 +8,39 @@ import (
 )
 
 type Config struct {
-	DataDir             string  `json:"data_dir"`
-	MemtableMaxBytes    int     `json:"memtable_max_bytes"`
-	MaxImmutableTables  int     `json:"max_immutable_tables"`
-	BlockSize           int     `json:"block_size"`
-	BloomFalsePositive  float64 `json:"bloom_false_positive"`
-	WALFsyncEveryN      int     `json:"wal_fsync_every_n"`
-	WALSegmentRollBytes int     `json:"wal_segment_roll_bytes"`
-	Compression         string  `json:"compression"`
-	LogLevel            string  `json:"log_level"`
-	L0CompactionTrigger int     `json:"l0_compaction_trigger"`
+	DataDir               string  `json:"data_dir"`
+	MemtableMaxBytes      int     `json:"memtable_max_bytes"`
+	MaxImmutableTables    int     `json:"max_immutable_tables"`
+	BlockSize             int     `json:"block_size"`
+	BloomFalsePositive    float64 `json:"bloom_false_positive"`
+	WALFsyncEveryN        int     `json:"wal_fsync_every_n"`
+	WALSegmentRollBytes   int     `json:"wal_segment_roll_bytes"`
+	Compression           string  `json:"compression"`
+	LogLevel              string  `json:"log_level"`
+	L0CompactionTrigger   int     `json:"l0_compaction_trigger"`
+	SizeTieredFanIn       int     `json:"size_tiered_fan_in"`      // K tables per job; default 4
+	SizeTieredSizeRatio   float64 `json:"size_tiered_size_ratio"`  // max size spread within a pick; default 2.0
+	TombstoneGraceSeconds int     `json:"tombstone_grace_seconds"` // reserved; we KEEP all tombstones (Phase B)
+
+	L0StopWrites int `json:"l0_stop_writes"` // Put/Delete fail with ErrWriteStall when SST count >= this; 0=off; default 20
 }
 
 func DefaultConfig() Config {
 	return Config{
-		DataDir:             "./data",
-		MemtableMaxBytes:    67108864,
-		MaxImmutableTables:  2,
-		BlockSize:           8192,
-		BloomFalsePositive:  0.01,
-		WALFsyncEveryN:      1,
-		WALSegmentRollBytes: 64 * 1024 * 1024, // 64 MiB
-		Compression:         "off",
-		LogLevel:            "info",
-		L0CompactionTrigger: 4,
+		DataDir:               "./data",
+		MemtableMaxBytes:      67108864,
+		MaxImmutableTables:    2,
+		BlockSize:             8192,
+		BloomFalsePositive:    0.01,
+		WALFsyncEveryN:        1,
+		WALSegmentRollBytes:   64 * 1024 * 1024, // 64 MiB
+		Compression:           "off",
+		LogLevel:              "info",
+		L0CompactionTrigger:   8,
+		SizeTieredFanIn:       4,
+		SizeTieredSizeRatio:   2.0,
+		TombstoneGraceSeconds: 86400,
+		L0StopWrites:          20,
 	}
 }
 
@@ -100,6 +109,24 @@ func (c Config) Validate() error {
 	if c.L0CompactionTrigger < 0 {
 		return fmt.Errorf("l0_compaction_trigger must be >= 0: %w", ErrInvalidArgument)
 	}
+
+	if c.SizeTieredFanIn < 2 {
+		return fmt.Errorf("%w: size_tiered_fan_in must be >= 2", ErrInvalidArgument)
+	}
+	if c.SizeTieredSizeRatio < 1.0 {
+		return fmt.Errorf("%w: size_tiered_size_ratio must be >= 1.0", ErrInvalidArgument)
+	}
+	if c.TombstoneGraceSeconds < 0 {
+		return fmt.Errorf("%w: tombstone_grace_seconds must be >= 0", ErrInvalidArgument)
+	}
+	if c.L0StopWrites < 0 {
+		return fmt.Errorf("%w: l0_stop_writes must be >= 0", ErrInvalidArgument)
+	}
+	if c.L0StopWrites > 0 && c.L0CompactionTrigger > 0 && c.L0StopWrites < c.L0CompactionTrigger {
+		return fmt.Errorf("%w: l0_stop_writes (%d) should be >= l0_compaction_trigger (%d)",
+			ErrInvalidArgument, c.L0StopWrites, c.L0CompactionTrigger)
+	}
+
 	switch c.Compression {
 	case "off", "snappy", "lz4":
 	default:

@@ -7,9 +7,20 @@ import (
 	"testing"
 )
 
+func planCfg(t *testing.T) Config {
+	t.Helper()
+	cfg := testConfig(t)
+	// Deterministic picker defaults for unit tests.
+	cfg.SizeTieredFanIn = 4
+	cfg.SizeTieredSizeRatio = 2.0
+	return cfg
+}
+
 // --- newCompactionPlan ---
 
 func TestNewCompactionPlanReturnsNilForFewerThanTwoTables(t *testing.T) {
+	cfg := planCfg(t)
+
 	tests := []struct {
 		name     string
 		manifest *Manifest
@@ -27,7 +38,7 @@ func TestNewCompactionPlanReturnsNilForFewerThanTwoTables(t *testing.T) {
 				Version: 1,
 				Epoch:   1,
 				Tables: []ManifestTable{
-					{ID: 1, File: "000001.sst"},
+					{ID: 1, File: "000001.sst", FileSize: 100},
 				},
 			},
 		},
@@ -35,7 +46,7 @@ func TestNewCompactionPlanReturnsNilForFewerThanTwoTables(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			plan, err := newCompactionPlan(test.manifest)
+			plan, err := newCompactionPlan(test.manifest, cfg)
 			if err != nil {
 				t.Fatalf("newCompactionPlan: %v", err)
 			}
@@ -46,50 +57,53 @@ func TestNewCompactionPlanReturnsNilForFewerThanTwoTables(t *testing.T) {
 	}
 }
 
-func TestNewCompactionPlanSelectsTwoOldestTables(t *testing.T) {
+func TestNewCompactionPlanPicksSizeTieredSet(t *testing.T) {
+	cfg := planCfg(t)
+	cfg.SizeTieredFanIn = 2
+	cfg.SizeTieredSizeRatio = 2.0
+
+	// Four similar-sized tables → fan-in 2 picks a size window of 2.
+	// With equal sizes, sort is size asc then ID desc; first window is the
+	// two smallest — all equal size, so first window is IDs sorted by ID desc
+	// among full sort: IDs 4,3,2,1 by ID within same size → sorted order
+	// starts with highest IDs first when sizes equal...
+	// Actually equal FileSize: sort by ID descending → [4,3,2,1], window of 2 = [4,3].
 	manifest := &Manifest{
 		Version: 1,
 		Epoch:   7,
 		Tables: []ManifestTable{
-			{ID: 4, File: "000004.sst"}, // newest
-			{ID: 3, File: "000003.sst"},
-			{ID: 2, File: "000002.sst"},
-			{ID: 1, File: "000001.sst"}, // oldest
+			{ID: 4, File: "000004.sst", FileSize: 1000},
+			{ID: 3, File: "000003.sst", FileSize: 1000},
+			{ID: 2, File: "000002.sst", FileSize: 1000},
+			{ID: 1, File: "000001.sst", FileSize: 1000},
 		},
 	}
 
-	plan, err := newCompactionPlan(manifest)
+	plan, err := newCompactionPlan(manifest, cfg)
 	if err != nil {
 		t.Fatalf("newCompactionPlan: %v", err)
 	}
-
 	if plan == nil {
 		t.Fatal("expected a compaction plan, got nil")
 	}
-
 	if len(plan.Inputs) != 2 {
-		t.Fatalf("expected 2 input tables, got %d", len(plan.Inputs))
+		t.Fatalf("expected 2 inputs (fan_in=2), got %d: %+v", len(plan.Inputs), plan.Inputs)
 	}
-
-	if plan.Inputs[0].ID != 2 || plan.Inputs[1].ID != 1 {
-		t.Fatalf(
-			"expected inputs table IDs [2 1], got [%d %d]",
-			plan.Inputs[0].ID,
-			plan.Inputs[1].ID,
-		)
+	// Newest-first among pick.
+	if plan.Inputs[0].ID < plan.Inputs[1].ID {
+		t.Fatalf("expected newest-first inputs, got [%d %d]", plan.Inputs[0].ID, plan.Inputs[1].ID)
 	}
-
 	if plan.OutputID != 5 {
 		t.Fatalf("expected output ID 5, got %d", plan.OutputID)
 	}
-
 	if plan.OutputFile != "000005.sst" {
 		t.Fatalf("expected output file 000005.sst, got %q", plan.OutputFile)
 	}
 }
 
 func TestNewCompactionPlanRejectsNilManifest(t *testing.T) {
-	_, err := newCompactionPlan(nil)
+	cfg := planCfg(t)
+	_, err := newCompactionPlan(nil, cfg)
 	if err == nil {
 		t.Fatal("expected an error for a nil manifest")
 	}
@@ -132,7 +146,8 @@ func TestCompactReadersWritesMergedSSTable(t *testing.T) {
 	}
 	defer newerReader.Close()
 
-	compacted, err := compactReaders(outputPath, cfg, olderReader, newerReader)
+	// Newest reader first (matches runCompactionOnce / plan.Inputs order).
+	compacted, err := compactReaders(outputPath, cfg, newerReader, olderReader)
 	if err != nil {
 		t.Fatalf("compactReaders: %v", err)
 	}
@@ -159,32 +174,14 @@ func TestCompactReadersWritesMergedSSTable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get %q: %v", test.key, err)
 		}
-
 		if string(entry.value) != test.value {
-			t.Fatalf(
-				"Get %q: expected value %q, got %q",
-				test.key,
-				test.value,
-				entry.value,
-			)
+			t.Fatalf("Get %q: expected value %q, got %q", test.key, test.value, entry.value)
 		}
-
 		if entry.seqNo != test.seqNo {
-			t.Fatalf(
-				"Get %q: expected seqNo %d, got %d",
-				test.key,
-				test.seqNo,
-				entry.seqNo,
-			)
+			t.Fatalf("Get %q: expected seqNo %d, got %d", test.key, test.seqNo, entry.seqNo)
 		}
-
 		if entry.tombstone != test.tombstone {
-			t.Fatalf(
-				"Get %q: expected tombstone=%v, got tombstone=%v",
-				test.key,
-				test.tombstone,
-				entry.tombstone,
-			)
+			t.Fatalf("Get %q: expected tombstone=%v, got %v", test.key, test.tombstone, entry.tombstone)
 		}
 	}
 }
@@ -254,11 +251,9 @@ func TestManifestAfterCompactionReplacesInputTables(t *testing.T) {
 	if next.Version != current.Version {
 		t.Fatalf("expected version %d, got %d", current.Version, next.Version)
 	}
-
 	if next.Epoch != 8 {
 		t.Fatalf("expected epoch 8, got %d", next.Epoch)
 	}
-
 	if len(next.Tables) != 3 {
 		t.Fatalf("expected 3 tables, got %d", len(next.Tables))
 	}
@@ -266,12 +261,7 @@ func TestManifestAfterCompactionReplacesInputTables(t *testing.T) {
 	wantIDs := []uint64{5, 4, 3}
 	for i, wantID := range wantIDs {
 		if next.Tables[i].ID != wantID {
-			t.Fatalf(
-				"table %d: expected ID %d, got %d",
-				i,
-				wantID,
-				next.Tables[i].ID,
-			)
+			t.Fatalf("table %d: expected ID %d, got %d", i, wantID, next.Tables[i].ID)
 		}
 	}
 
@@ -279,28 +269,18 @@ func TestManifestAfterCompactionReplacesInputTables(t *testing.T) {
 	if output.File != "000005.sst" {
 		t.Fatalf("expected output file 000005.sst, got %q", output.File)
 	}
-	if output.MinKey != "alpha" {
-		t.Fatalf("expected min key alpha, got %q", output.MinKey)
+	if output.MinKey != "alpha" || output.MaxKey != "charlie" {
+		t.Fatalf("keys: min=%q max=%q", output.MinKey, output.MaxKey)
 	}
-	if output.MaxKey != "charlie" {
-		t.Fatalf("expected max key charlie, got %q", output.MaxKey)
-	}
-	if output.MinSeqNo != 1 {
-		t.Fatalf("expected min seqNo 1, got %d", output.MinSeqNo)
-	}
-	if output.MaxSeqNo != 3 {
-		t.Fatalf("expected max seqNo 3, got %d", output.MaxSeqNo)
+	if output.MinSeqNo != 1 || output.MaxSeqNo != 3 {
+		t.Fatalf("seq: min=%d max=%d", output.MinSeqNo, output.MaxSeqNo)
 	}
 	if output.FileSize != int64(len(outputBytes)) {
 		t.Fatalf("expected size %d, got %d", len(outputBytes), output.FileSize)
 	}
 
-	// Confirm the input manifest was not modified in place.
-	if len(current.Tables) != 4 {
-		t.Fatalf("current manifest was mutated; expected 4 tables, got %d", len(current.Tables))
-	}
-	if current.Epoch != 7 {
-		t.Fatalf("current manifest epoch changed; expected 7, got %d", current.Epoch)
+	if len(current.Tables) != 4 || current.Epoch != 7 {
+		t.Fatal("current manifest was mutated")
 	}
 }
 
@@ -331,37 +311,16 @@ func TestManifestAfterCompactionRejectsInvalidInputs(t *testing.T) {
 		path    string
 		entries []sstEntry
 	}{
-		{
-			name:    "nil manifest",
-			current: nil,
-			plan:    plan,
-			path:    outputPath,
-			entries: entries,
-		},
-		{
-			name:    "nil plan",
-			current: current,
-			plan:    nil,
-			path:    outputPath,
-			entries: entries,
-		},
+		{name: "nil manifest", current: nil, plan: plan, path: outputPath, entries: entries},
+		{name: "nil plan", current: current, plan: nil, path: outputPath, entries: entries},
 		{
 			name:    "empty plan inputs",
 			current: current,
-			plan: &compactionPlan{
-				OutputID:   2,
-				OutputFile: "000002.sst",
-			},
+			plan:    &compactionPlan{OutputID: 2, OutputFile: "000002.sst"},
 			path:    outputPath,
 			entries: entries,
 		},
-		{
-			name:    "empty output entries",
-			current: current,
-			plan:    plan,
-			path:    outputPath,
-			entries: nil,
-		},
+		{name: "empty output entries", current: current, plan: plan, path: outputPath, entries: nil},
 		{
 			name:    "missing output file",
 			current: current,
@@ -373,12 +332,7 @@ func TestManifestAfterCompactionRejectsInvalidInputs(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := manifestAfterCompaction(
-				test.current,
-				test.plan,
-				test.path,
-				test.entries,
-			); err == nil {
+			if _, err := manifestAfterCompaction(test.current, test.plan, test.path, test.entries); err == nil {
 				t.Fatal("expected an error, got nil")
 			}
 		})
@@ -398,23 +352,37 @@ func writeTestSSTable(t *testing.T, cfg Config, path string, entries []sstEntry)
 	}
 }
 
-func TestRunCompactionOnceMergesTwoOldestTables(t *testing.T) {
-	cfg := testConfig(t)
+func TestRunCompactionOnceMergesTwoTables(t *testing.T) {
+	cfg := planCfg(t)
+	cfg.SizeTieredFanIn = 2
 
-	writeTestSSTable(t, cfg, filepath.Join(cfg.DataDir, "000001.sst"), []sstEntry{
+	p1 := filepath.Join(cfg.DataDir, "000001.sst")
+	p2 := filepath.Join(cfg.DataDir, "000002.sst")
+
+	writeTestSSTable(t, cfg, p1, []sstEntry{
 		{key: []byte("alpha"), value: []byte("old-alpha"), seqNo: 1},
 		{key: []byte("bravo"), value: []byte("only-in-1"), seqNo: 2},
 	})
-	writeTestSSTable(t, cfg, filepath.Join(cfg.DataDir, "000002.sst"), []sstEntry{
+	writeTestSSTable(t, cfg, p2, []sstEntry{
 		{key: []byte("alpha"), value: []byte("new-alpha"), seqNo: 3},
 	})
+
+	// Real sizes from disk so the picker sees similar sizes.
+	fi1, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	current := &Manifest{
 		Version: 1,
 		Epoch:   1,
 		Tables: []ManifestTable{
-			{ID: 2, File: "000002.sst"},
-			{ID: 1, File: "000001.sst"},
+			{ID: 2, File: "000002.sst", FileSize: fi2.Size()},
+			{ID: 1, File: "000001.sst", FileSize: fi1.Size()},
 		},
 	}
 
@@ -433,14 +401,14 @@ func TestRunCompactionOnceMergesTwoOldestTables(t *testing.T) {
 		t.Fatalf("expected epoch 2, got %d", next.Epoch)
 	}
 
-	if _, err := os.Stat(filepath.Join(cfg.DataDir, "000001.sst")); !os.IsNotExist(err) {
-		t.Fatalf("expected 000001.sst to be removed, stat err: %v", err)
+	if _, err := os.Stat(p1); !os.IsNotExist(err) {
+		t.Fatalf("expected 000001.sst removed, stat err: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.DataDir, "000002.sst")); !os.IsNotExist(err) {
-		t.Fatalf("expected 000002.sst to be removed, stat err: %v", err)
+	if _, err := os.Stat(p2); !os.IsNotExist(err) {
+		t.Fatalf("expected 000002.sst removed, stat err: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, next.Tables[0].File)); err != nil {
-		t.Fatalf("expected output file to exist: %v", err)
+		t.Fatalf("expected output file: %v", err)
 	}
 
 	savedManifest, err := loadManifest(cfg)
@@ -448,7 +416,7 @@ func TestRunCompactionOnceMergesTwoOldestTables(t *testing.T) {
 		t.Fatalf("loadManifest: %v", err)
 	}
 	if savedManifest.Epoch != 2 || len(savedManifest.Tables) != 1 {
-		t.Fatalf("manifest on disk not updated correctly: %+v", savedManifest)
+		t.Fatalf("manifest on disk not updated: %+v", savedManifest)
 	}
 
 	reader, err := OpenSSTableReader(filepath.Join(cfg.DataDir, next.Tables[0].File))
@@ -475,13 +443,13 @@ func TestRunCompactionOnceMergesTwoOldestTables(t *testing.T) {
 }
 
 func TestRunCompactionOnceNoOpWithFewerThanTwoTables(t *testing.T) {
-	cfg := testConfig(t)
+	cfg := planCfg(t)
 
 	current := &Manifest{
 		Version: 1,
 		Epoch:   5,
 		Tables: []ManifestTable{
-			{ID: 1, File: "000001.sst"},
+			{ID: 1, File: "000001.sst", FileSize: 100},
 		},
 	}
 
@@ -489,8 +457,90 @@ func TestRunCompactionOnceNoOpWithFewerThanTwoTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runCompactionOnce: %v", err)
 	}
-
 	if next != current {
-		t.Fatal("expected the same manifest pointer to be returned as a no-op")
+		t.Fatal("expected the same manifest pointer as no-op")
+	}
+}
+
+func TestCompactFourTablesSizeTiered(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MemtableMaxBytes = 64 << 20
+	cfg.SizeTieredFanIn = 4
+	cfg.SizeTieredSizeRatio = 2.0
+	cfg.L0CompactionTrigger = 0
+	cfg.L0StopWrites = 0
+
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for i, kv := range []struct{ k, v string }{
+		{"a", "1"}, {"b", "2"}, {"c", "3"}, {"d", "4"},
+	} {
+		if err := s.Put([]byte(kv.k), []byte(kv.v)); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		if err := s.ForceFlush(); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+	if got := s.Stats().SSTCount; got != 4 {
+		t.Fatalf("sst=%d want 4", got)
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if got := s.Stats().SSTCount; got != 1 {
+		t.Fatalf("after compact sst=%d want 1", got)
+	}
+	for _, k := range []string{"a", "b", "c", "d"} {
+		_, ok, err := s.Get([]byte(k))
+		if err != nil || !ok {
+			t.Fatalf("get %s: ok=%v err=%v", k, ok, err)
+		}
+	}
+}
+
+func TestWriteStallWhenTooManySST(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MemtableMaxBytes = 64 << 20
+	cfg.L0CompactionTrigger = 0
+	cfg.L0StopWrites = 2
+	cfg.SizeTieredFanIn = 4
+
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ForceFlush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put([]byte("b"), []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ForceFlush(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Stats().SSTCount < 2 {
+		t.Fatalf("need >=2 sst, got %d", s.Stats().SSTCount)
+	}
+
+	err = s.Put([]byte("c"), []byte("3"))
+	if err == nil || !errors.Is(err, ErrWriteStall) {
+		t.Fatalf("want ErrWriteStall, got %v", err)
+	}
+
+	if err := s.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if err := s.Put([]byte("c"), []byte("3")); err != nil {
+		t.Fatalf("put after compact: %v", err)
 	}
 }

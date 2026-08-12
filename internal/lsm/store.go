@@ -22,12 +22,10 @@ type Store struct {
 	version    *Version
 	manifest   *Manifest
 
-	// bg owns flush/compaction workers. It is started in Open and stopped in Close.
+	// bg owns flush/compaction workers. Started in Open, stopped in Close.
 	bg *scheduler
 
 	// lastBGError is the most recent background worker failure, if any.
-	// It is exposed through Stats.EngineStatus so operators can see silent
-	// background problems without crashing the process.
 	lastBGError error
 }
 
@@ -74,14 +72,12 @@ func Open(cfg Config) (*Store, error) {
 		case WALOpDel:
 			mem.Delete(rec.Key, rec.SeqNo)
 		}
-
 		if rec.SeqNo > maxSeq {
 			maxSeq = rec.SeqNo
 		}
 	}
 
-	// Preserve the highest sequence number already durable in SSTables so a
-	// post-flush reopen does not restart seqNo at 0.
+	// Preserve highest seq already durable in SSTables after flush/reopen.
 	for _, t := range manifest.Tables {
 		if t.MaxSeqNo > maxSeq {
 			maxSeq = t.MaxSeqNo
@@ -101,10 +97,7 @@ func Open(cfg Config) (*Store, error) {
 		},
 	}
 
-	// Start background workers after the store is fully constructed so the
-	// workers never observe a half-initialized Store.
 	store.bg = newScheduler(store, cfg.MaxImmutableTables)
-
 	return store, nil
 }
 
@@ -120,6 +113,11 @@ func (s *Store) Put(key, value []byte) error {
 		return ErrStoreClosed
 	}
 
+	// L0 write stall: too many live SSTables; wait for compaction (or Compact()).
+	if err := s.checkWriteStallLocked(); err != nil {
+		return err
+	}
+
 	s.seqNo++
 
 	rec := WALRecord{Op: WALOpPut, SeqNo: s.seqNo, Key: key, Value: value}
@@ -128,7 +126,6 @@ func (s *Store) Put(key, value []byte) error {
 	}
 
 	s.mem.Put(key, value, s.seqNo)
-
 	return s.rotateIfNeededLocked()
 }
 
@@ -172,7 +169,6 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	if entry.tombstone {
 		return nil, false, nil
 	}
-
 	return entry.value, true, nil
 }
 
@@ -188,6 +184,10 @@ func (s *Store) Delete(key []byte) error {
 		return ErrStoreClosed
 	}
 
+	if err := s.checkWriteStallLocked(); err != nil {
+		return err
+	}
+
 	s.seqNo++
 
 	rec := WALRecord{Op: WALOpDel, SeqNo: s.seqNo, Key: key}
@@ -196,13 +196,27 @@ func (s *Store) Delete(key []byte) error {
 	}
 
 	s.mem.Delete(key, s.seqNo)
-
 	return s.rotateIfNeededLocked()
 }
 
-// rotateIfNeededLocked freezes the active memtable when it is full and asks
-// the background scheduler to flush. Unlike the old path, this does NOT
-// perform SSTable disk I/O under the write lock.
+// checkWriteStallLocked returns ErrWriteStall when live SST count is at/above
+// L0StopWrites (0 disables). Caller must hold s.mu.
+func (s *Store) checkWriteStallLocked() error {
+	if s.cfg.L0StopWrites <= 0 {
+		return nil
+	}
+	n := 0
+	if s.version != nil {
+		n = len(s.version.SSTables)
+	}
+	if n >= s.cfg.L0StopWrites {
+		return fmt.Errorf("%w: live_sst=%d limit=%d", ErrWriteStall, n, s.cfg.L0StopWrites)
+	}
+	return nil
+}
+
+// rotateIfNeededLocked freezes the active memtable when full and enqueues a
+// background flush. Does not perform SSTable I/O under the write lock.
 func (s *Store) rotateIfNeededLocked() error {
 	if s.mem.Bytes() < int64(s.cfg.MemtableMaxBytes) {
 		return nil
@@ -215,17 +229,13 @@ func (s *Store) rotateIfNeededLocked() error {
 	s.immutables = append(s.immutables, s.mem)
 	s.mem = newMemtable()
 
-	// enqueueFlush is non-blocking and only touches a channel, so it is
-	// safe while holding s.mu.
 	if s.bg != nil {
 		s.bg.enqueueFlush()
 	}
-
 	return nil
 }
 
-// flushPendingImmutables is used by the background flush worker.
-// It repeatedly flushes the oldest immutable until none remain.
+// flushPendingImmutables is used by the background flush worker and ForceFlush.
 func (s *Store) flushPendingImmutables() error {
 	for {
 		s.mu.Lock()
@@ -310,9 +320,7 @@ func (s *Store) flushOldestImmutableLocked() error {
 	s.manifest = newManifest
 	s.immutables = s.immutables[1:]
 
-	// Only reset the WAL when nothing remains in memory that still depends
-	// on those WAL records: no immutables left and the active memtable is empty.
-	// Otherwise a crash between flush and the next Put could lose unflushed data.
+	// Reset WAL only when nothing in memory still depends on those records.
 	if len(s.immutables) == 0 && s.mem.Len() == 0 {
 		if err := s.wal.Reset(); err != nil {
 			return fmt.Errorf("reset wal after flush: %w", err)
@@ -322,12 +330,11 @@ func (s *Store) flushOldestImmutableLocked() error {
 	return nil
 }
 
-// Compact runs at most one size-tiered compaction cycle: it merges the two
-// oldest SSTables in the current manifest into one, publishes the resulting
-// manifest, and rebuilds the store's Version so future reads see the merged
-// table instead of the two originals.
+// Compact runs at most one size-tiered compaction (picker may select 2..K
+// tables). Publishes the new manifest and rebuilds Version. No-op if < 2 SSTs.
 //
-// It is a no-op (returns nil) if fewer than two SSTables currently exist.
+// Flush priority: if immutables are pending, Compact returns nil without
+// compacting so flush can drain first (call ForceFlush then Compact if needed).
 func (s *Store) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -336,11 +343,15 @@ func (s *Store) Compact() error {
 		return ErrStoreClosed
 	}
 
+	if len(s.immutables) > 0 {
+		// Prefer flush over compaction (spec scheduling priority).
+		return nil
+	}
+
 	nextManifest, err := runCompactionOnce(s.cfg, s.manifest)
 	if err != nil {
 		return err
 	}
-
 	if nextManifest == s.manifest {
 		return nil
 	}
@@ -364,7 +375,6 @@ func (s *Store) Compact() error {
 	if oldVersion != nil {
 		_ = oldVersion.Close()
 	}
-
 	return nil
 }
 
@@ -374,16 +384,13 @@ func (s *Store) ForceFlush() error {
 		s.mu.Unlock()
 		return ErrStoreClosed
 	}
-
 	if err := s.rotateActiveIfNonEmptyLocked(); err != nil {
 		s.mu.Unlock()
 		return err
 	}
 	s.mu.Unlock()
 
-	// Perform the actual disk work outside the initial lock section by
-	// reusing the same path the background worker uses. ForceFlush is
-	// synchronous by contract: callers want data on disk before return.
+	// Synchronous drain; does not auto-enqueue compaction.
 	return s.flushPendingImmutables()
 }
 
@@ -391,18 +398,15 @@ func (s *Store) rotateActiveIfNonEmptyLocked() error {
 	if s.mem.Len() == 0 {
 		return nil
 	}
-
 	if s.cfg.MaxImmutableTables > 0 && len(s.immutables) >= s.cfg.MaxImmutableTables {
 		return ErrTooManyImmutables
 	}
-
 	s.immutables = append(s.immutables, s.mem)
 	s.mem = newMemtable()
 	return nil
 }
 
 func (s *Store) FlushAll() error {
-	// FlushAll only drains already-immutable tables. Keep that contract.
 	return s.flushPendingImmutables()
 }
 
@@ -437,11 +441,9 @@ func (s *Store) Stats() Stats {
 	} else {
 		s.stats.EngineStatus = "open"
 	}
-
 	return s.stats
 }
 
-// BGStatus returns a snapshot of background worker state for the CLI.
 func (s *Store) BGStatus() BGStatus {
 	if s.bg == nil {
 		return BGStatus{}
@@ -450,7 +452,6 @@ func (s *Store) BGStatus() BGStatus {
 }
 
 // liveSSTCount is used by the scheduler auto-compact policy.
-// Matches Stats().SSTCount: number of live readers in the current Version.
 func (s *Store) liveSSTCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -460,7 +461,13 @@ func (s *Store) liveSSTCount() int {
 	return len(s.version.SSTables)
 }
 
-// recordBackgroundError stores the latest background failure for Stats().
+// immutableCount for scheduler flush-priority checks.
+func (s *Store) immutableCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.immutables)
+}
+
 func (s *Store) recordBackgroundError(op string, err error) {
 	if err == nil {
 		return
@@ -470,23 +477,17 @@ func (s *Store) recordBackgroundError(op string, err error) {
 	s.lastBGError = fmt.Errorf("%s: %w", op, err)
 }
 
-// Close is graceful by default (same as CloseGraceful).
 func (s *Store) Close() error {
 	return s.CloseGraceful()
 }
 
-// CloseGraceful stops background workers, drains remaining immutables to
-// SSTables, then closes the WAL and Version.
 func (s *Store) CloseGraceful() error {
-	// Stop workers first so they are not racing Close on WAL/Version.
 	if s.bg != nil {
 		s.bg.stopGraceful()
 	}
 	return s.finishClose(true)
 }
 
-// CloseFast stops workers quickly and does NOT drain immutables to disk.
-// Durable data remains in the WAL and is recovered on the next Open.
 func (s *Store) CloseFast() error {
 	if s.bg != nil {
 		s.bg.stopFast()
@@ -520,7 +521,6 @@ func (s *Store) finishClose(drainImmutables bool) error {
 	if err := s.wal.Close(); err != nil {
 		return err
 	}
-
 	if err := s.version.Close(); err != nil {
 		return err
 	}

@@ -84,6 +84,7 @@ func (s *scheduler) runFlushWorker() {
 				s.store.recordBackgroundError("flush", err)
 				continue
 			}
+			// After a successful flush, maybe kick auto-compaction.
 			s.maybeEnqueueCompact()
 
 		case <-s.stopCh:
@@ -98,6 +99,15 @@ func (s *scheduler) runCompactWorker() {
 	for {
 		select {
 		case <-s.compactQueue:
+			// Spec priority: flush beats compaction. If immutables are still
+			// waiting, prefer draining them and try compact again later.
+			if s.store.immutableCount() > 0 {
+				s.enqueueFlush()
+				// Re-queue compact so it runs after flush progress (non-blocking).
+				s.enqueueCompact()
+				continue
+			}
+
 			s.compactRunning.Store(true)
 			start := time.Now()
 			err := s.store.Compact()
@@ -119,7 +129,7 @@ func (s *scheduler) enqueueFlush() {
 	select {
 	case s.flushQueue <- job{kind: jobFlush}:
 	default:
-		// Queue full: next successful rotation/enqueue or ForceFlush still drains.
+		// Queue full: next rotation or ForceFlush still drains.
 	}
 }
 
@@ -132,12 +142,16 @@ func (s *scheduler) enqueueCompact() {
 
 // maybeEnqueueCompact schedules compaction only when live SST count
 // meets the configured trigger. trigger <= 0 disables auto-compact.
+// Also skips while immutables remain (flush first).
 func (s *scheduler) maybeEnqueueCompact() {
 	if s.store == nil {
 		return
 	}
 	trigger := s.store.cfg.L0CompactionTrigger
 	if trigger <= 0 {
+		return
+	}
+	if s.store.immutableCount() > 0 {
 		return
 	}
 	if s.store.liveSSTCount() >= trigger {
