@@ -25,7 +25,6 @@ func newVersionFromManifest(m *Manifest, readers []*SSTableReader) *Version {
 		Epoch:    m.Epoch,
 		SSTables: readers,
 	}
-
 }
 
 // Get searches every SSTable held by this Version, newest first, and
@@ -36,8 +35,12 @@ func newVersionFromManifest(m *Manifest, readers []*SSTableReader) *Version {
 // If no table contains the key, it returns ErrNotFound. If a table read
 // fails for a reason other than "key absent" (e.g. corruption), that error
 // is returned immediately rather than silently continuing to older tables.
-func (v *Version) Get(key []byte) (sstEntry, error) {
+//
+// Unit 8: wires the store metrics pointer into each reader before the call
+// so bloom/block counters are updated transparently.
+func (v *Version) Get(key []byte, metrics *Metrics) (sstEntry, error) {
 	for _, r := range v.SSTables {
+		r.metrics = metrics
 		entry, err := r.Get(key)
 		if err == nil {
 			return entry, nil

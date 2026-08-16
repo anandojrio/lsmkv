@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,8 +62,13 @@ func main() {
 	case "close":
 		runClose(args)
 
+	case "manifest-info":
+		runManifestInfo(args)
+
+	case "list-sst":
+		runListSST(args)
+
 	case "run":
-		// Kept for compatibility with the original project skeleton.
 		run(args)
 
 	default:
@@ -82,7 +88,6 @@ func runInit(args []string) {
 		fatalf("create data dir error: %v", err)
 	}
 
-	// Open creates or loads the WAL directory, first segment, and manifest.
 	store, err := lsm.Open(cfg)
 	if err != nil {
 		fatalf("open store error: %v", err)
@@ -167,19 +172,37 @@ func runStats(args []string) {
 	defer closeStore(store)
 
 	stats := store.Stats()
+	m := stats.Metrics
 
-	fmt.Println("store stats")
-	fmt.Printf("engine status: %s\n", stats.EngineStatus)
-	fmt.Printf("active segment id: %d\n", stats.ActiveSegmentID)
-	fmt.Printf("bytes written: %d\n", stats.BytesWritten)
-	fmt.Printf("total wal segments: %d\n", stats.TotalWALSegments)
-	fmt.Printf("last seqno: %d\n", stats.LastSeqNo)
-	fmt.Printf("active entries: %d\n", stats.ActiveEntries)
-	fmt.Printf("active bytes: %d\n", stats.ActiveBytes)
-	fmt.Printf("immutables count: %d\n", stats.ImmutablesCount)
-	fmt.Printf("immutables bytes: %d\n", stats.ImmutablesBytes)
-	fmt.Printf("sst count: %d\n", stats.SSTCount)
-	fmt.Printf("sst total bytes: %d\n", stats.SSTTotalBytes)
+	fmt.Println("=== store stats ===")
+	fmt.Printf("engine_status:      %s\n", stats.EngineStatus)
+	fmt.Printf("last_seqno:         %d\n", stats.LastSeqNo)
+	fmt.Println("")
+	fmt.Println("--- wal ---")
+	fmt.Printf("active_segment_id:  %d\n", stats.ActiveSegmentID)
+	fmt.Printf("total_wal_segments: %d\n", stats.TotalWALSegments)
+	fmt.Printf("bytes_written:      %d\n", stats.BytesWritten)
+	fmt.Println("")
+	fmt.Println("--- memtable ---")
+	fmt.Printf("active_entries:     %d\n", stats.ActiveEntries)
+	fmt.Printf("active_bytes:       %d\n", stats.ActiveBytes)
+	fmt.Printf("immutables_count:   %d\n", stats.ImmutablesCount)
+	fmt.Printf("immutables_bytes:   %d\n", stats.ImmutablesBytes)
+	fmt.Println("")
+	fmt.Println("--- sstables ---")
+	fmt.Printf("sst_count:          %d\n", stats.SSTCount)
+	fmt.Printf("sst_total_bytes:    %d\n", stats.SSTTotalBytes)
+	fmt.Println("")
+	fmt.Println("--- metrics (unit 8) ---")
+	fmt.Printf("puts_total:               %d\n", m.PutsTotal)
+	fmt.Printf("deletes_total:            %d\n", m.DeletesTotal)
+	fmt.Printf("bloom_checks_total:       %d\n", m.BloomChecksTotal)
+	fmt.Printf("bloom_skips_total:        %d\n", m.BloomSkipsTotal)
+	fmt.Printf("block_reads_total:        %d\n", m.BlockReadsTotal)
+	fmt.Printf("flushes_total:            %d\n", m.FlushesTotal)
+	fmt.Printf("compactions_total:        %d\n", m.CompactionsTotal)
+	fmt.Printf("last_flush_duration_ms:   %d\n", m.LastFlushDurationMs)
+	fmt.Printf("last_compact_duration_ms: %d\n", m.LastCompactDurationMs)
 }
 
 func runBGStatus(args []string) {
@@ -249,8 +272,6 @@ func runCompact(args []string) {
 func runClose(args []string) {
 	flags := mustParseFlags(args, false, false)
 
-	// Each CLI invocation is a separate process. This command is mainly a
-	// clean open-and-close durability smoke test.
 	store := mustOpenStore(flags.Config)
 
 	var err error
@@ -270,6 +291,131 @@ func runClose(args []string) {
 	}
 }
 
+// runManifestInfo čita manifest JSON direktno — bez otvaranja Store-a.
+// Ispisuje listu svih SST-ova sa metapodacima.
+func runManifestInfo(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	cfg, err := lsm.LoadConfig(flags.Config)
+	if err != nil {
+		fatalf("load config error: %v", err)
+	}
+
+	manifestPath := filepath.Join(cfg.DataDir, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		fatalf("read manifest error: %v", err)
+	}
+
+	var raw struct {
+		Epoch  uint64 `json:"epoch"`
+		Tables []struct {
+			ID       uint64 `json:"id"`
+			File     string `json:"file"`
+			MinKey   string `json:"min_key"`
+			MaxKey   string `json:"max_key"`
+			MinSeqNo uint64 `json:"min_seq_no"`
+			MaxSeqNo uint64 `json:"max_seq_no"`
+			FileSize int64  `json:"file_size"`
+		} `json:"tables"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		fatalf("parse manifest error: %v", err)
+	}
+
+	fmt.Printf("=== manifest info (epoch %d) ===\n", raw.Epoch)
+	fmt.Printf("sst count: %d\n\n", len(raw.Tables))
+
+	if len(raw.Tables) == 0 {
+		fmt.Println("(no sstables)")
+		return
+	}
+
+	fmt.Printf("%-8s %-16s %-20s %-20s %-10s %-10s %-12s\n",
+		"id", "file", "min_key", "max_key", "min_seq", "max_seq", "size_bytes")
+	fmt.Println(strings.Repeat("-", 100))
+
+	for _, t := range raw.Tables {
+		minKey := t.MinKey
+		if len(minKey) > 18 {
+			minKey = minKey[:15] + "..."
+		}
+		maxKey := t.MaxKey
+		if len(maxKey) > 18 {
+			maxKey = maxKey[:15] + "..."
+		}
+		fmt.Printf("%-8d %-16s %-20s %-20s %-10d %-10d %-12d\n",
+			t.ID, t.File, minKey, maxKey, t.MinSeqNo, t.MaxSeqNo, t.FileSize)
+	}
+}
+
+// runListSST otvara svaki SST fajl i ispisuje detalje:
+// broj entries, seq range, bloom bits, veličinu.
+func runListSST(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	cfg, err := lsm.LoadConfig(flags.Config)
+	if err != nil {
+		fatalf("load config error: %v", err)
+	}
+
+	manifestPath := filepath.Join(cfg.DataDir, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		fatalf("read manifest error: %v", err)
+	}
+
+	var raw struct {
+		Epoch  uint64 `json:"epoch"`
+		Tables []struct {
+			ID       uint64 `json:"id"`
+			File     string `json:"file"`
+			MinSeqNo uint64 `json:"min_seq_no"`
+			MaxSeqNo uint64 `json:"max_seq_no"`
+			FileSize int64  `json:"file_size"`
+		} `json:"tables"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		fatalf("parse manifest error: %v", err)
+	}
+
+	fmt.Printf("=== list-sst (epoch=%d, count=%d) ===\n\n", raw.Epoch, len(raw.Tables))
+
+	if len(raw.Tables) == 0 {
+		fmt.Println("(no sstables)")
+		return
+	}
+
+	fmt.Printf("%-8s %-16s %-10s %-10s %-10s %-12s\n",
+		"id", "file", "entries", "min_seq", "max_seq", "size_bytes")
+	fmt.Println(strings.Repeat("-", 76))
+
+	for _, t := range raw.Tables {
+		sstPath := filepath.Join(cfg.DataDir, t.File)
+		entryCount := countSSTEntries(sstPath)
+		fmt.Printf("%-8d %-16s %-10d %-10d %-10d %-12d\n",
+			t.ID, t.File, entryCount, t.MinSeqNo, t.MaxSeqNo, t.FileSize)
+	}
+}
+
+// countSSTEntries otvara SST reader i broji sve entries.
+// Vraća -1 ako fajl nije čitljiv.
+func countSSTEntries(path string) int {
+	r, err := lsm.OpenSSTableReader(path)
+	if err != nil {
+		return -1
+	}
+	defer r.Close()
+
+	entries, err := r.AllEntries()
+	if err != nil {
+		return -1
+	}
+	return len(entries)
+}
+
 func run(args []string) {
 	flags := mustParseFlags(args, false, false)
 
@@ -282,20 +428,6 @@ func run(args []string) {
 	fmt.Printf("block size: %d\n", cfg.BlockSize)
 }
 
-// mustParseFlags parses the small shared CLI flag set.
-//
-// Accepted forms:
-//
-//	--config path
-//	--config=path
-//	--key key
-//	--key=key
-//	--value value
-//	--value=value
-//	--fast
-//
-// The caller declares whether a key and/or value is required. Value is allowed
-// to be intentionally empty, for example: --value="".
 func mustParseFlags(args []string, requireKey, requireValue bool) commandFlags {
 	flags := commandFlags{
 		Config: defaultConfigPath,
@@ -363,8 +495,6 @@ func mustParseFlags(args []string, requireKey, requireValue bool) commandFlags {
 	return flags
 }
 
-// nextFlagValue returns the token directly after a --name form. It rejects a
-// missing value and rejects another flag being accidentally consumed as value.
 func nextFlagValue(args []string, index *int, name string) string {
 	nextIndex := *index + 1
 
@@ -409,7 +539,6 @@ func closeStore(store *lsm.Store) {
 		return
 	}
 
-	// Graceful close by default for every CLI command that opened a store.
 	if err := store.Close(); err != nil && err != lsm.ErrStoreClosed {
 		fmt.Fprintf(os.Stderr, "close store error: %v\n", err)
 	}
@@ -433,6 +562,8 @@ func printUsage() {
 	fmt.Printf("  %s flush [--config path]\n", exe)
 	fmt.Printf("  %s compact [--config path]\n", exe)
 	fmt.Printf("  %s close [--fast] [--config path]\n", exe)
+	fmt.Printf("  %s manifest-info [--config path]\n", exe)
+	fmt.Printf("  %s list-sst [--config path]\n", exe)
 	fmt.Printf("  %s run [--config path] (legacy smoke test)\n", exe)
 	fmt.Printf("  %s help\n", exe)
 }
