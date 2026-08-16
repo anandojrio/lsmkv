@@ -2,6 +2,8 @@ package lsm
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -386,7 +388,8 @@ func TestRunCompactionOnceMergesTwoTables(t *testing.T) {
 		},
 	}
 
-	next, err := runCompactionOnce(cfg, current)
+	next, err := runCompactionOnce(cfg, current, &Metrics{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("runCompactionOnce: %v", err)
 	}
@@ -453,7 +456,8 @@ func TestRunCompactionOnceNoOpWithFewerThanTwoTables(t *testing.T) {
 		},
 	}
 
-	next, err := runCompactionOnce(cfg, current)
+	next, err := runCompactionOnce(cfg, current, &Metrics{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("runCompactionOnce: %v", err)
 	}

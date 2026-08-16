@@ -2,9 +2,11 @@ package lsm
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 // This file holds compaction orchestration: size-tiered picking (compactionPlan),
@@ -265,7 +267,11 @@ func manifestAfterCompaction(
 //  6. Delete input files only after manifest is durable
 //
 // Fewer than two tables → no-op, returns current unchanged.
-func runCompactionOnce(cfg Config, current *Manifest) (*Manifest, error) {
+//
+// Unit 8: accepts metrics and logger; both may be nil (no-op when nil).
+func runCompactionOnce(cfg Config, current *Manifest, metrics *Metrics, logger *slog.Logger) (*Manifest, error) {
+	start := time.Now()
+
 	plan, err := newCompactionPlan(current, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("plan compaction: %w", err)
@@ -298,6 +304,10 @@ func runCompactionOnce(cfg Config, current *Manifest) (*Manifest, error) {
 	}
 	defer func() { _ = compactedReader.Close() }()
 
+	// Unit 9 crash point: SST is on disk but manifest not yet saved.
+	// In production this is always a no-op (nil hook).
+	runCrashHook("afterSSTRename")
+
 	outputEntries, err := compactedReader.AllEntries()
 	if err != nil {
 		return nil, fmt.Errorf("read back compacted sstable: %w", err)
@@ -318,6 +328,20 @@ func runCompactionOnce(cfg Config, current *Manifest) (*Manifest, error) {
 		if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("remove old sstable %s: %w", input.File, err)
 		}
+	}
+
+	// Metrics + log AFTER manifest je durable i input fajlovi obrisani.
+	durMs := time.Since(start).Milliseconds()
+	if metrics != nil {
+		metrics.CompactionsTotal.Add(1)
+		metrics.LastCompactDurationMs.Store(durMs)
+	}
+	if logger != nil {
+		logger.Info("compact job",
+			"inputs_count", len(plan.Inputs),
+			"output_id", plan.OutputID,
+			"duration_ms", durMs,
+		)
 	}
 
 	return nextManifest, nil

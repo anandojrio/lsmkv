@@ -3,9 +3,11 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type Store struct {
@@ -27,6 +29,10 @@ type Store struct {
 
 	// lastBGError is the most recent background worker failure, if any.
 	lastBGError error
+
+	// Unit 8: metrics and structured logger.
+	metrics Metrics
+	log     *slog.Logger
 }
 
 func Open(cfg Config) (*Store, error) {
@@ -92,6 +98,7 @@ func Open(cfg Config) (*Store, error) {
 		seqNo:      maxSeq,
 		version:    version,
 		manifest:   manifest,
+		log:        slog.Default(),
 		stats: Stats{
 			EngineStatus: "open",
 		},
@@ -113,7 +120,6 @@ func (s *Store) Put(key, value []byte) error {
 		return ErrStoreClosed
 	}
 
-	// L0 write stall: too many live SSTables; wait for compaction (or Compact()).
 	if err := s.checkWriteStallLocked(); err != nil {
 		return err
 	}
@@ -126,6 +132,7 @@ func (s *Store) Put(key, value []byte) error {
 	}
 
 	s.mem.Put(key, value, s.seqNo)
+	s.metrics.PutsTotal.Add(1)
 	return s.rotateIfNeededLocked()
 }
 
@@ -148,7 +155,6 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 		return value, true, nil
 	}
 
-	// Newest immutable first: later rotations are appended, so reverse scan.
 	for i := len(s.immutables) - 1; i >= 0; i-- {
 		if value, tombstone, found := s.immutables[i].Get(key); found {
 			if tombstone {
@@ -158,7 +164,7 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 		}
 	}
 
-	entry, err := s.version.Get(key)
+	entry, err := s.version.Get(key, &s.metrics)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, false, nil
@@ -196,11 +202,10 @@ func (s *Store) Delete(key []byte) error {
 	}
 
 	s.mem.Delete(key, s.seqNo)
+	s.metrics.DeletesTotal.Add(1)
 	return s.rotateIfNeededLocked()
 }
 
-// checkWriteStallLocked returns ErrWriteStall when live SST count is at/above
-// L0StopWrites (0 disables). Caller must hold s.mu.
 func (s *Store) checkWriteStallLocked() error {
 	if s.cfg.L0StopWrites <= 0 {
 		return nil
@@ -210,13 +215,15 @@ func (s *Store) checkWriteStallLocked() error {
 		n = len(s.version.SSTables)
 	}
 	if n >= s.cfg.L0StopWrites {
+		s.log.Warn("write stall",
+			"live_sst", n,
+			"limit", s.cfg.L0StopWrites,
+		)
 		return fmt.Errorf("%w: live_sst=%d limit=%d", ErrWriteStall, n, s.cfg.L0StopWrites)
 	}
 	return nil
 }
 
-// rotateIfNeededLocked freezes the active memtable when full and enqueues a
-// background flush. Does not perform SSTable I/O under the write lock.
 func (s *Store) rotateIfNeededLocked() error {
 	if s.mem.Bytes() < int64(s.cfg.MemtableMaxBytes) {
 		return nil
@@ -225,6 +232,11 @@ func (s *Store) rotateIfNeededLocked() error {
 	if s.cfg.MaxImmutableTables > 0 && len(s.immutables) >= s.cfg.MaxImmutableTables {
 		return ErrTooManyImmutables
 	}
+
+	s.log.Info("rotate",
+		"seq_no", s.seqNo,
+		"memtable_bytes", s.mem.Bytes(),
+	)
 
 	s.immutables = append(s.immutables, s.mem)
 	s.mem = newMemtable()
@@ -235,7 +247,6 @@ func (s *Store) rotateIfNeededLocked() error {
 	return nil
 }
 
-// flushPendingImmutables is used by the background flush worker and ForceFlush.
 func (s *Store) flushPendingImmutables() error {
 	for {
 		s.mu.Lock()
@@ -259,6 +270,8 @@ func (s *Store) flushOldestImmutableLocked() error {
 	if len(s.immutables) == 0 {
 		return nil
 	}
+
+	start := time.Now()
 
 	imm := s.immutables[0]
 	entries := imm.AllEntries()
@@ -320,21 +333,26 @@ func (s *Store) flushOldestImmutableLocked() error {
 	s.manifest = newManifest
 	s.immutables = s.immutables[1:]
 
-	// Reset WAL only when nothing in memory still depends on those records.
 	if len(s.immutables) == 0 && s.mem.Len() == 0 {
 		if err := s.wal.Reset(); err != nil {
 			return fmt.Errorf("reset wal after flush: %w", err)
 		}
 	}
 
+	// Metrics + log AFTER publish — nikad između rename i manifest save.
+	durMs := time.Since(start).Milliseconds()
+	s.metrics.FlushesTotal.Add(1)
+	s.metrics.LastFlushDurationMs.Store(durMs)
+	s.log.Info("flush publish",
+		"sst_id", id,
+		"entries", len(entries),
+		"duration_ms", durMs,
+		"epoch", newManifest.Epoch,
+	)
+
 	return nil
 }
 
-// Compact runs at most one size-tiered compaction (picker may select 2..K
-// tables). Publishes the new manifest and rebuilds Version. No-op if < 2 SSTs.
-//
-// Flush priority: if immutables are pending, Compact returns nil without
-// compacting so flush can drain first (call ForceFlush then Compact if needed).
 func (s *Store) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -344,11 +362,12 @@ func (s *Store) Compact() error {
 	}
 
 	if len(s.immutables) > 0 {
-		// Prefer flush over compaction (spec scheduling priority).
 		return nil
 	}
 
-	nextManifest, err := runCompactionOnce(s.cfg, s.manifest)
+	// Stari potpis: runCompactionOnce(s.cfg, s.manifest)
+	// Novi potpis (Unit 8): proslijeđujemo metrics i logger
+	nextManifest, err := runCompactionOnce(s.cfg, s.manifest, &s.metrics, s.log)
 	if err != nil {
 		return err
 	}
@@ -390,7 +409,6 @@ func (s *Store) ForceFlush() error {
 	}
 	s.mu.Unlock()
 
-	// Synchronous drain; does not auto-enqueue compaction.
 	return s.flushPendingImmutables()
 }
 
@@ -441,6 +459,10 @@ func (s *Store) Stats() Stats {
 	} else {
 		s.stats.EngineStatus = "open"
 	}
+
+	// Unit 8: prikvači metrics snapshot.
+	s.stats.Metrics = s.metrics.Snapshot()
+
 	return s.stats
 }
 
@@ -451,7 +473,12 @@ func (s *Store) BGStatus() BGStatus {
 	return s.bg.status()
 }
 
-// liveSSTCount is used by the scheduler auto-compact policy.
+// MetricsSnapshot returns a point-in-time snapshot of all engine counters.
+// Lightweight — samo atomic loads, bez locka.
+func (s *Store) MetricsSnapshot() MetricsSnapshot {
+	return s.metrics.Snapshot()
+}
+
 func (s *Store) liveSSTCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -461,7 +488,6 @@ func (s *Store) liveSSTCount() int {
 	return len(s.version.SSTables)
 }
 
-// immutableCount for scheduler flush-priority checks.
 func (s *Store) immutableCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

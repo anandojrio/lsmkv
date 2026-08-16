@@ -18,6 +18,9 @@ type SSTableReader struct {
 	bloom       *bloomFilter    // in-memory bloom filter loaded once at open
 	size        int64           // total file size in bytes
 	indexOffset int64
+
+	// Unit 8: wired by version.Get; nil means no metrics collection.
+	metrics *Metrics
 }
 
 // OpenSSTableReader opens the file, reads the footer, loads the index and
@@ -100,7 +103,14 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 // Returns ErrCorruptionDetected if a CRC check fails.
 func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 	// Stage 1: Bloom filter check — free exit for missing keys.
+	// Unit 8: count every bloom probe, and count skips (definite misses).
+	if r.metrics != nil {
+		r.metrics.BloomChecksTotal.Add(1)
+	}
 	if !r.bloom.mayContain(key) {
+		if r.metrics != nil {
+			r.metrics.BloomSkipsTotal.Add(1)
+		}
 		return sstEntry{}, ErrNotFound
 	}
 
@@ -111,6 +121,7 @@ func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 	}
 
 	// Stage 3: Read that data block from disk.
+	// Unit 8: count every data block read from disk.
 	f, err := os.Open(r.path)
 	if err != nil {
 		return sstEntry{}, fmt.Errorf("open sst for read: %w", err)
@@ -121,6 +132,9 @@ func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 	blockBytes := make([]byte, blockSize)
 	if _, err := f.ReadAt(blockBytes, blockOffset); err != nil {
 		return sstEntry{}, fmt.Errorf("read sst block: %w", err)
+	}
+	if r.metrics != nil {
+		r.metrics.BlockReadsTotal.Add(1)
 	}
 
 	// Stage 4: Linear scan within the block for the key.
