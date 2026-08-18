@@ -11,13 +11,14 @@ import (
 func testConfig(t *testing.T) Config {
 	t.Helper()
 	return Config{
-		DataDir:            t.TempDir(),
-		MemtableMaxBytes:   67108864,
-		BlockSize:          8192,
-		BloomFalsePositive: 0.01,
-		WALFsyncEveryN:     1,
-		Compression:        "off",
-		LogLevel:           "info",
+		DataDir:             t.TempDir(),
+		MemtableMaxBytes:    67108864,
+		BlockSize:           8192,
+		BloomFalsePositive:  0.01,
+		WALFsyncEveryN:      1,
+		WALSegmentRollBytes: 1024,  //dodato: Ranije: test helper je pravio nepotpun config; WALSegmentRollBytes je ostajao 0.
+		Compression:         "off", //dodato: Sada: svaki test koji koristi testConfig(t) dobija validan segment limit od 1024 B.
+		LogLevel:            "info",
 	}
 }
 

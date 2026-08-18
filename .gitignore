@@ -1,0 +1,13 @@
+# Build artifacts
+*.exe
+
+# IDE files
+.idea/
+.vscode/
+
+# Local runtime data
+data/
+
+# Local notes excluded from the repository
+HANDOFF.md
+PROJECT_STATUS.md

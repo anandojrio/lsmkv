@@ -101,9 +101,12 @@ func (s *scheduler) runCompactWorker() {
 		case <-s.compactQueue:
 			// Spec priority: flush beats compaction. If immutables are still
 			// waiting, prefer draining them and try compact again later.
-			if s.store.immutableCount() > 0 {
+			s.store.mu.RLock()
+			hasImmutables := s.store.immutableCountLocked() > 0
+			s.store.mu.RUnlock()
+
+			if hasImmutables {
 				s.enqueueFlush()
-				// Re-queue compact so it runs after flush progress (non-blocking).
 				s.enqueueCompact()
 				continue
 			}
@@ -151,10 +154,15 @@ func (s *scheduler) maybeEnqueueCompact() {
 	if trigger <= 0 {
 		return
 	}
-	if s.store.immutableCount() > 0 {
+	s.store.mu.RLock()
+	immutables := s.store.immutableCountLocked()
+	liveSST := s.store.liveSSTCountLocked()
+	s.store.mu.RUnlock()
+
+	if immutables > 0 {
 		return
 	}
-	if s.store.liveSSTCount() >= trigger {
+	if liveSST >= trigger {
 		s.enqueueCompact()
 	}
 }

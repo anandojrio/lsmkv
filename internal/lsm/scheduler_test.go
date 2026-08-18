@@ -229,3 +229,56 @@ func TestBackgroundFlushMayAutoCompactAtTrigger(t *testing.T) {
 		t.Fatalf("unexpected SSTCount=%d", st.SSTCount)
 	}
 }
+func TestBackgroundFlushEventuallyDrainsImmutables(t *testing.T) { //dodato: Šta tačno proverava:Da više malih write-ova naprave rotacije. Da background flush worker zaista odradi posao. Da ImmutablesCount na kraju padne na 0. Da je barem jedan SST objavljen. Da su svi upisani ključevi i dalje čitljivi.
+	cfg := testConfig(t)
+	cfg.MemtableMaxBytes = 1
+	cfg.MaxImmutableTables = 8
+	cfg.L0CompactionTrigger = 0
+
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	for i := 0; i < 3; i++ {
+		key := []byte{byte('a' + i)}
+		val := []byte{byte('1' + i)}
+		if err := s.Put(key, val); err != nil {
+			t.Fatalf("Put %q: %v", key, err)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := s.Stats()
+		if st.ImmutablesCount == 0 && st.SSTCount >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	st := s.Stats()
+	if st.ImmutablesCount != 0 {
+		t.Fatalf("expected background flush to drain immutables, got %d", st.ImmutablesCount)
+	}
+	if st.SSTCount < 1 {
+		t.Fatalf("expected at least one sstable after background flush, got %d", st.SSTCount)
+	}
+
+	for i := 0; i < 3; i++ {
+		key := []byte{byte('a' + i)}
+		want := string([]byte{byte('1' + i)})
+
+		got, found, err := s.Get(key)
+		if err != nil {
+			t.Fatalf("Get %q: %v", key, err)
+		}
+		if !found {
+			t.Fatalf("expected key %q to be found after background flush", key)
+		}
+		if string(got) != want {
+			t.Fatalf("key %q: got %q, want %q", key, got, want)
+		}
+	}
+}

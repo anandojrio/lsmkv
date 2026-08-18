@@ -479,19 +479,26 @@ func (s *Store) MetricsSnapshot() MetricsSnapshot {
 	return s.metrics.Snapshot()
 }
 
-func (s *Store) liveSSTCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.version == nil {
+func (s *Store) liveSSTCountLocked() int { //dodato - Stara stavka: helper funkcije koje same uzimaju RLock, pa se pozivaju iz scheduler toka bez jasne kontrole nad lock granicama.
+	if s.version == nil { //dodato - Nova stavka: locked i unlocked varijante, tako da caller odlučuje da li je lock već uzet i izbegava nested RLock obrazac.
 		return 0
 	}
 	return len(s.version.SSTables)
 }
 
+func (s *Store) immutableCountLocked() int {
+	return len(s.immutables)
+}
+func (s *Store) liveSSTCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.liveSSTCountLocked()
+}
+
 func (s *Store) immutableCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.immutables)
+	return s.immutableCountLocked()
 }
 
 func (s *Store) recordBackgroundError(op string, err error) {

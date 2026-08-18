@@ -1,9 +1,11 @@
 package lsm
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -292,4 +294,163 @@ func TestRestartWithOrphanSSTIsClean(t *testing.T) {
 // structured log lines don't pollute test output.
 func noopLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+const hardCrashHelperEnv = "LSMKV_HARD_CRASH_HELPER"
+
+func TestHardCrashAfterAcknowledgedPutsRecoverFromWAL(t *testing.T) { //dodato: novi test za subprocess crash posle dva uspešna Put
+	if os.Getenv(hardCrashHelperEnv) == "1" {
+		runHardCrashPutHelper()
+		return
+	}
+
+	dataDir := t.TempDir()
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestHardCrashAfterAcknowledgedPutsRecoverFromWAL")
+	cmd.Env = append(os.Environ(),
+		hardCrashHelperEnv+"=1",
+		"LSMKV_HARD_CRASH_DATA_DIR="+dataDir,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hard-crash helper failed: %v\noutput:\n%s", err, output)
+	}
+
+	cfg := testConfig(t)
+	cfg.DataDir = dataDir
+	cfg.WALFsyncEveryN = 1
+	cfg.MemtableMaxBytes = 64 * 1024 * 1024
+
+	store, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen after hard crash: %v", err)
+	}
+	defer store.Close()
+
+	assertRecoveredValue(t, store, "k1", "v1")
+	assertRecoveredValue(t, store, "k2", "v2")
+}
+
+func runHardCrashPutHelper() {
+	dataDir := os.Getenv("LSMKV_HARD_CRASH_DATA_DIR")
+	if dataDir == "" {
+		fmt.Fprintln(os.Stderr, "missing LSMKV_HARD_CRASH_DATA_DIR")
+		os.Exit(2)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.WALFsyncEveryN = 1
+	cfg.MemtableMaxBytes = 64 * 1024 * 1024
+
+	store, err := Open(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open store:", err)
+		os.Exit(2)
+	}
+
+	if err := store.Put([]byte("k1"), []byte("v1")); err != nil {
+		fmt.Fprintln(os.Stderr, "put k1:", err)
+		os.Exit(2)
+	}
+
+	if err := store.Put([]byte("k2"), []byte("v2")); err != nil {
+		fmt.Fprintln(os.Stderr, "put k2:", err)
+		os.Exit(2)
+	}
+
+	// Namerno nema store.Close(): simuliramo prekid procesa nakon
+	// successful, fsync-ovanih Put operacija.
+	os.Exit(0)
+}
+
+func assertRecoveredValue(t *testing.T, store *Store, key, want string) {
+	t.Helper()
+
+	got, found, err := store.Get([]byte(key))
+	if err != nil {
+		t.Fatalf("Get %q after restart: %v", key, err)
+	}
+	if !found {
+		t.Fatalf("expected %q to survive hard crash", key)
+	}
+	if string(got) != want {
+		t.Fatalf("Get %q after restart: got %q, want %q", key, got, want)
+	}
+}
+func TestHardCrashAfterAcknowledgedDeleteRecoversTombstone(t *testing.T) {
+	if os.Getenv(hardCrashHelperEnv) == "1" {
+		runHardCrashDeleteHelper()
+		return
+	}
+
+	dataDir := t.TempDir()
+
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=TestHardCrashAfterAcknowledgedDeleteRecoversTombstone",
+	)
+	cmd.Env = append(
+		os.Environ(),
+		hardCrashHelperEnv+"=1",
+		"LSMKV_HARD_CRASH_DATA_DIR="+dataDir,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hard-crash delete helper failed: %v\noutput:\n%s", err, output)
+	}
+
+	cfg := testConfig(t)
+	cfg.DataDir = dataDir
+	cfg.WALFsyncEveryN = 1
+	cfg.MemtableMaxBytes = 64 * 1024 * 1024
+
+	store, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen after hard crash: %v", err)
+	}
+	defer store.Close()
+
+	_, found, err := store.Get([]byte("gone"))
+	if err != nil {
+		t.Fatalf("Get gone after restart: %v", err)
+	}
+	if found {
+		t.Fatal("expected acknowledged tombstone to survive hard crash")
+	}
+}
+
+func runHardCrashDeleteHelper() {
+	dataDir := os.Getenv("LSMKV_HARD_CRASH_DATA_DIR")
+	if dataDir == "" {
+		fmt.Fprintln(os.Stderr, "missing LSMKV_HARD_CRASH_DATA_DIR")
+		os.Exit(2)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.WALFsyncEveryN = 1
+	cfg.MemtableMaxBytes = 64 * 1024 * 1024
+
+	store, err := Open(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open store:", err)
+		os.Exit(2)
+	}
+
+	if err := store.Put([]byte("gone"), []byte("value")); err != nil {
+		fmt.Fprintln(os.Stderr, "put gone:", err)
+		os.Exit(2)
+	}
+
+	if err := store.Delete([]byte("gone")); err != nil {
+		fmt.Fprintln(os.Stderr, "delete gone:", err)
+		os.Exit(2)
+	}
+
+	// Namerno nema store.Close(): i Put i Delete su acknowledged i
+	// fsync-ovani, a child proces se prekida bez graceful shutdown-a.
+	os.Exit(0)
 }

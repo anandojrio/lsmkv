@@ -50,6 +50,42 @@ func loadManifest(cfg Config) (*Manifest, error) {
 	if m.Version == 0 {
 		return nil, fmt.Errorf("manifest missing version: %w", ErrCorruptionDetected)
 	}
+	if m.Version != 1 { //dodato: Zamenjena stavka: “manifest je validan ako JSON može da se parsira i Version != 0”.
+		return nil, fmt.Errorf("manifest unsupported version %d: %w", m.Version, ErrCorruptionDetected) //dodato: Novom stavkom: “manifest je validan samo ako je strukturalno i semantički konzistentan”
+	}
+
+	seenIDs := make(map[uint64]struct{}, len(m.Tables))
+	seenFiles := make(map[string]struct{}, len(m.Tables))
+
+	for _, table := range m.Tables {
+		if table.ID == 0 {
+			return nil, fmt.Errorf("manifest table has invalid id 0: %w", ErrCorruptionDetected)
+		}
+		if table.File == "" {
+			return nil, fmt.Errorf("manifest table has empty file: %w", ErrCorruptionDetected)
+		}
+		if table.MinKey > table.MaxKey {
+			return nil, fmt.Errorf("manifest table has invalid key range: %w", ErrCorruptionDetected)
+		}
+		if filepath.Base(table.File) != table.File {
+			return nil, fmt.Errorf("manifest table file must be base name only: %w", ErrCorruptionDetected)
+		}
+		if table.MinSeqNo > table.MaxSeqNo {
+			return nil, fmt.Errorf("manifest table has invalid seq range: %w", ErrCorruptionDetected)
+		}
+		if table.FileSize < 0 {
+			return nil, fmt.Errorf("manifest table has negative file size: %w", ErrCorruptionDetected)
+		}
+		if _, ok := seenIDs[table.ID]; ok {
+			return nil, fmt.Errorf("manifest has duplicate table id %d: %w", table.ID, ErrCorruptionDetected)
+		}
+		seenIDs[table.ID] = struct{}{}
+
+		if _, ok := seenFiles[table.File]; ok {
+			return nil, fmt.Errorf("manifest has duplicate table file %q: %w", table.File, ErrCorruptionDetected)
+		}
+		seenFiles[table.File] = struct{}{}
+	}
 
 	return &m, nil
 }

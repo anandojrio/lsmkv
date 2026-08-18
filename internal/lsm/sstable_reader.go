@@ -88,6 +88,42 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode sst index: %w", err)
 	}
+	if len(index) > 0 { //dodato - Staro ponašanje: reader proverava samo footer opsege, ali bezuslovno prihvata sadržaj index bloka nakon decode-a.
+		if index[0].byteOffset != 0 { //dodato - Novo ponašanje: reader prihvata index samo ako on konzistentno deli data deo SSTable-a na uređene blokove.
+			return nil, fmt.Errorf(
+				"sst index first block must start at offset 0: %w",
+				ErrCorruptionDetected,
+			)
+		}
+
+		for i, entry := range index {
+			if int64(entry.byteOffset) >= int64(indexOffset) {
+				return nil, fmt.Errorf(
+					"sst index block offset out of data range: %w",
+					ErrCorruptionDetected,
+				)
+			}
+
+			if i == 0 {
+				continue
+			}
+
+			previous := index[i-1]
+			if entry.byteOffset <= previous.byteOffset {
+				return nil, fmt.Errorf(
+					"sst index offsets must be strictly increasing: %w",
+					ErrCorruptionDetected,
+				)
+			}
+
+			if string(entry.firstKey) <= string(previous.firstKey) {
+				return nil, fmt.Errorf(
+					"sst index keys must be strictly increasing: %w",
+					ErrCorruptionDetected,
+				)
+			}
+		}
+	}
 
 	return &SSTableReader{
 		path:        path,
