@@ -1,6 +1,8 @@
 package lsm
 
 import (
+	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -228,5 +230,97 @@ func TestReplayWALTruncatesIncompleteSegmentTail(t *testing.T) {
 			info.Size(),
 			wantSize,
 		)
+	}
+}
+func TestOpenWALRejectsNegativeFsyncEveryN(t *testing.T) { //dodato:4 testa kojim simuliramo promene koje su obacene u wal.go
+	cfg := testConfig(t)
+	cfg.WALFsyncEveryN = -1
+
+	_, err := OpenWAL(cfg)
+	if err == nil {
+		t.Fatal("expected OpenWAL to reject negative WALFsyncEveryN")
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
+}
+
+func TestOpenWALRejectsTooSmallSegmentRollBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		rollBytes int
+	}{
+		{name: "zero", rollBytes: 0},
+		{name: "smaller than header", rollBytes: walSegmentHeaderSize - 1},
+		{name: "equal to header", rollBytes: walSegmentHeaderSize},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.WALSegmentRollBytes = tt.rollBytes
+
+			_, err := OpenWAL(cfg)
+			if err == nil {
+				t.Fatalf("expected OpenWAL to reject WALSegmentRollBytes=%d", tt.rollBytes)
+			}
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("expected ErrInvalidArgument, got %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenWALRejectsBadExistingSegmentMagic(t *testing.T) {
+	cfg := testConfig(t)
+	walDir := walDirectory(cfg.DataDir)
+
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatalf("create wal dir: %v", err)
+	}
+
+	path := walSegmentPath(walDir, 1)
+
+	header := make([]byte, walSegmentHeaderSize)
+	binary.LittleEndian.PutUint32(header[0:4], 0xDEADBEEF) // bad magic
+	header[4] = walSegmentVersion
+
+	if err := os.WriteFile(path, header, 0o644); err != nil {
+		t.Fatalf("write wal segment: %v", err)
+	}
+
+	_, err := OpenWAL(cfg)
+	if err == nil {
+		t.Fatal("expected OpenWAL to reject bad existing segment magic")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+
+func TestOpenWALRejectsUnsupportedExistingSegmentVersion(t *testing.T) {
+	cfg := testConfig(t)
+	walDir := walDirectory(cfg.DataDir)
+
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatalf("create wal dir: %v", err)
+	}
+
+	path := walSegmentPath(walDir, 1)
+
+	header := make([]byte, walSegmentHeaderSize)
+	binary.LittleEndian.PutUint32(header[0:4], walSegmentMagic)
+	header[4] = walSegmentVersion + 1 // unsupported version
+
+	if err := os.WriteFile(path, header, 0o644); err != nil {
+		t.Fatalf("write wal segment: %v", err)
+	}
+
+	_, err := OpenWAL(cfg)
+	if err == nil {
+		t.Fatal("expected OpenWAL to reject unsupported existing segment version")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
 	}
 }

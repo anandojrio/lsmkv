@@ -69,14 +69,32 @@ func (bf *bloomFilter) marshal() []byte {
 }
 
 // unmarshalBloom reconstructs a bloomFilter from its serialized bytes.
-func unmarshalBloom(data []byte) (*bloomFilter, error) {
-	if len(data) < 16 {
+func unmarshalBloom(data []byte) (*bloomFilter, error) { //dodato - Pre: svaki payload sa najmanje 16 bajtova postaje Bloom filter, čak i ako ima nelogične vrednosti.
+	if len(data) < 16 { //dodato - Posle: prihvata se samo Bloom filter čiji:m nije nula,m je deljiv sa 8,k nije nula,broj bit bytes tačno odgovara m / 8.
 		return nil, ErrCorruptionDetected
 	}
 	m := binary.LittleEndian.Uint64(data[0:8])
 	k := binary.LittleEndian.Uint64(data[8:16])
 	bits := append([]byte(nil), data[16:]...)
-	return &bloomFilter{bits: bits, m: m, k: k}, nil
+
+	if m == 0 {
+		return nil, ErrCorruptionDetected
+	}
+	if m%8 != 0 {
+		return nil, ErrCorruptionDetected
+	}
+	if k == 0 {
+		return nil, ErrCorruptionDetected
+	}
+	if uint64(len(bits)) != m/8 {
+		return nil, ErrCorruptionDetected
+	}
+
+	return &bloomFilter{
+		bits: bits,
+		m:    m,
+		k:    k,
+	}, nil
 }
 
 // bloomHash returns two independent 64-bit hashes for double-hashing.

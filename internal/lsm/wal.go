@@ -43,7 +43,17 @@ func walSegmentPath(dir string, id int) string {
 
 func OpenWAL(cfg Config) (*WAL, error) {
 	dir := walDirectory(cfg.DataDir)
+	if cfg.WALFsyncEveryN < 0 { //dodato: ranije je OpenWAL mogao da prihvati besmislen WALSegmentRollBytes, i negativan WALFsyncEveryN, sada to odmah odbija sa jasnom greškom.
+		return nil, fmt.Errorf("%w: wal fsync interval must be >= 0", ErrInvalidArgument)
+	}
 
+	if cfg.WALSegmentRollBytes <= walSegmentHeaderSize {
+		return nil, fmt.Errorf(
+			"%w: wal segment roll bytes must be > %d",
+			ErrInvalidArgument,
+			walSegmentHeaderSize,
+		)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create wal directory: %w", err)
 	}
@@ -122,6 +132,27 @@ func (w *WAL) openExistingSegment(id int) error {
 	if info.Size() < walSegmentHeaderSize {
 		_ = file.Close()
 		return fmt.Errorf("%w: wal segment %s is smaller than header", ErrCorruptionDetected, path)
+	}
+
+	header := make([]byte, walSegmentHeaderSize) //dodato:Zamenili smo minimalnu proveru “fajl je dovoljno velik” sa pravom proverom identiteta i verzije segmenta.(Sada startup odmah staje ako aktivni segment nije validan)
+	if _, err := file.ReadAt(header, 0); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("read wal segment header: %w", err)
+	}
+
+	if binary.LittleEndian.Uint32(header[0:4]) != walSegmentMagic {
+		_ = file.Close()
+		return fmt.Errorf("%w: bad wal segment magic in %s", ErrCorruptionDetected, path)
+	}
+
+	if header[4] != walSegmentVersion {
+		_ = file.Close()
+		return fmt.Errorf(
+			"%w: unsupported wal segment version %d in %s",
+			ErrCorruptionDetected,
+			header[4],
+			path,
+		)
 	}
 
 	w.file = file

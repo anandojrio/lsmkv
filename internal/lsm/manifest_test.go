@@ -1,6 +1,7 @@
 package lsm
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
@@ -70,5 +71,171 @@ func TestLoadManifestCorruptedReturnsError(t *testing.T) {
 	_, err := loadManifest(cfg)
 	if err == nil {
 		t.Fatal("expected corruption error")
+	}
+}
+func TestLoadManifestRejectsUnsupportedVersion(t *testing.T) { //dodato: testovi za izmenu u manifest.go(metoda loadManifest)
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 2,
+        "epoch": 1,
+        "tables": []
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected unsupported version error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+
+func TestLoadManifestRejectsDuplicateTableID(t *testing.T) {
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 1,
+        "epoch": 1,
+        "tables": [
+            {"id": 1, "file": "000001.sst", "min_key": "a", "max_key": "b", "min_seq_no": 1, "max_seq_no": 2, "file_size": 10},
+            {"id": 1, "file": "000002.sst", "min_key": "c", "max_key": "d", "min_seq_no": 3, "max_seq_no": 4, "file_size": 20}
+        ]
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected duplicate table id error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+
+func TestLoadManifestRejectsDuplicateTableFile(t *testing.T) {
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 1,
+        "epoch": 1,
+        "tables": [
+            {"id": 1, "file": "000001.sst", "min_key": "a", "max_key": "b", "min_seq_no": 1, "max_seq_no": 2, "file_size": 10},
+            {"id": 2, "file": "000001.sst", "min_key": "c", "max_key": "d", "min_seq_no": 3, "max_seq_no": 4, "file_size": 20}
+        ]
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected duplicate table file error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+
+func TestLoadManifestRejectsInvalidSeqRange(t *testing.T) {
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 1,
+        "epoch": 1,
+        "tables": [
+            {"id": 1, "file": "000001.sst", "min_key": "a", "max_key": "b", "min_seq_no": 5, "max_seq_no": 4, "file_size": 10}
+        ]
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected invalid seq range error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+
+func TestLoadManifestRejectsEmptyFile(t *testing.T) {
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 1,
+        "epoch": 1,
+        "tables": [
+            {"id": 1, "file": "", "min_key": "a", "max_key": "b", "min_seq_no": 1, "max_seq_no": 4, "file_size": 10}
+        ]
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected empty file error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+
+func TestLoadManifestRejectsPathTraversalFile(t *testing.T) {
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 1,
+        "epoch": 1,
+        "tables": [
+            {"id": 1, "file": "../000001.sst", "min_key": "a", "max_key": "b", "min_seq_no": 1, "max_seq_no": 4, "file_size": 10}
+        ]
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected path traversal file error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
+	}
+}
+func TestLoadManifestRejectsInvalidKeyRange(t *testing.T) {
+	cfg := testConfig(t)
+
+	path := manifestPath(cfg)
+	data := []byte(`{
+        "version": 1,
+        "epoch": 1,
+        "tables": [
+            {"id": 1, "file": "000001.sst", "min_key": "z", "max_key": "a", "min_seq_no": 1, "max_seq_no": 4, "file_size": 10}
+        ]
+    }`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := loadManifest(cfg)
+	if err == nil {
+		t.Fatal("expected invalid key range error")
+	}
+	if !errors.Is(err, ErrCorruptionDetected) {
+		t.Fatalf("expected ErrCorruptionDetected, got %v", err)
 	}
 }
