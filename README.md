@@ -1,99 +1,209 @@
 # lsmkv
 
-`lsmkv` je single-node, durable key-value storage engine implementiran u Go-u, zasnovan na LSM-tree arhitekturi.
+`lsmkv` je durable, Dynamo-inspired distributed key-value store implementiran u Go-u.
 
-Trenutna implementacija pokriva samo lokalni storage engine: WAL durability, memtable, SSTable fajlove, manifest/version publishing, background flush, compaction, crash recovery i integrity validation. Distribuirani deo projekta nije obuhvaćen ovim dokumentom.
+Projekat ima dva sloja:
+
+1. **LSM storage engine** — lokalni, crash-safe storage sa WAL-om, memtable-om, SSTable fajlovima, manifestom, background flush-om i compaction-om.
+2. **Distribution layer** — višestruki node-ovi povezani preko gRPC-a, consistent hashing ring, replication i configurable quorum `N/R/W` operacije.
+
+Trenutno je implementiran i testiran funkcionalni distributed MVP za 3-node cluster:
+
+- `ReplicationFactor = 3`
+- `WriteQuorum = 2`
+- `ReadQuorum = 2`
+- coordinator forwarding
+- quorum `Put`, `Get` i `Delete`
+- tolerancija jednog nedostupnog noda dok quorum ostaje dostupan
+
+Projekat je inspirisan Dynamo-style arhitekturom, ali nije pokušaj potpune produkcijske implementacije Dynamo/Cassandra sistema. Napredne funkcionalnosti kao što su hinted handoff, vector clocks, anti-entropy repair i dynamic cluster membership su svesno odložene.
+
+---
 
 ## Features
 
-- `Put`, `Get` i `Delete` operacije
-- Overwrite semantika i tombstone zapisi za brisanje
-- Write-Ahead Log (WAL) pre memtable upisa
+### Local LSM Storage Engine
+
+- `Put`, `Get` i `Delete` operacije nad byte-string ključevima i vrednostima
+- Overwrite semantika
+- Tombstone zapisi za lokalni `Delete`
+- Write-Ahead Log pre memtable upisa
 - Konfigurisani WAL `fsync` durability režim
-- WAL segmentacija, record checksum i replay pri restart-u
+- WAL segmentacija, checksum validacija i replay pri restart-u
 - Oporavak od truncated/torn WAL tail-a
 - Memtable rotacija i immutable memtables
-- Background scheduler za flush i compaction posao
+- Background scheduler za flush i compaction
 - SSTable writer i reader
 - Bloom filter za optimizaciju SSTable lookup-a
 - Manifest kao authoritative source za live SSTable fajlove
-- Version layer za immutable published SSTable view
-- Force flush, graceful close i fast close putanje
+- Immutable published `Version` view za SSTable state
 - Size-tiered compaction
+- Force flush, graceful close i fast close putanje
 - Zaštita od orphan SSTable fajlova
 - Crash zaštita između SSTable rename-a i manifest publish-a
 - Hard-crash subprocess testovi za acknowledged `Put` i `Delete`
 - Defensive corruption validation za WAL, manifest, SSTable index i Bloom filter metadata
 
-## Project Structure
+### Distributed Quorum Layer
+
+- gRPC API za client-facing i internal node-to-node zahteve
+- Statička seed-list konfiguracija cluster-a
+- Consistent hashing ring sa virtual nodes
+- Deterministički izbor coordinator noda za svaki ključ
+- Preference list za izbor replica seta
+- Request forwarding: client može poslati zahtev bilo kom nodu
+- Configurable `ReplicationFactor`, `ReadQuorum` i `WriteQuorum`
+- Parallel replication prema preference list-i
+- Quorum `Put`: uspeh čim `W` replika potvrdi write
+- Quorum `Get`: uspeh čim `R` replika odgovori
+- Quorum `Delete`: uspeh čim `W` replika potvrdi delete
+- Early-return behavior: coordinator ne čeka nedostupnu/sporu repliku kada je quorum već postignut
+- Integration testovi sa tri izolovana noda, odvojenim storage direktorijumima i stvarnim gRPC pozivima
+- Testirani read/write/delete scenariji sa jednom nedostupnom replikom
+
+---
+
+## Current Distributed Model
+
+Podrazumevana demonstraciona konfiguracija koristi:
 
 ```text
-lsmkv-github/
-├── .vscode/                         # Lokalna editor konfiguracija
-├── cmd/
-│   └── lsmkv/
-│       └── main.go                  # Application entrypoint
-├── config/
-│   └── default.json                 # Podrazumevana konfiguracija engine-a
-├── data/                            # Lokalni runtime storage direktorijum
-│   └── wal/
-│       └── 000001.wal               # WAL segment generisan tokom rada
-├── internal/
-│   └── lsm/
-│       ├── bloom.go                 # Bloom filter implementacija i decode guards
-│       ├── bloom_test.go            # Bloom filter testovi i corruption guards
-│       ├── compaction.go            # Compaction orchestration
-│       ├── compaction_merge.go      # Merging SSTable podataka tokom compaction-a
-│       ├── compaction_merge_test.go # Testovi merge logike
-│       ├── compaction_picker.go     # Odabir SSTable fajlova za compaction
-│       ├── compaction_picker_test.go# Testovi compaction picker-a
-│       ├── compaction_test.go       # Integration testovi za compaction
-│       ├── config.go                # Config defaults, load i validation
-│       ├── config_test.go           # Config testovi
-│       ├── crash_hooks.go           # Injectable crash hooks za fault injection
-│       ├── crash_test.go            # Crash recovery i hard-crash durability testovi
-│       ├── errors.go                # Sentinel greške engine-a
-│       ├── manifest.go              # Manifest load/save i structural validation
-│       ├── manifest_test.go         # Manifest validation testovi
-│       ├── memtable.go              # In-memory sorted write structure
-│       ├── metrics.go               # Engine metrics i counters
-│       ├── scheduler.go             # Background flush/compaction scheduler
-│       ├── scheduler_test.go        # Scheduler behavior testovi
-│       ├── sstable_reader.go        # SSTable read path i integrity validation
-│       ├── sstable_reader_all_entries_test.go
-│       ├── sstable_reader_test.go   # SSTable reader testovi
-│       ├── sstable_writer.go        # SSTable file writer
-│       ├── sstable_writer_test.go   # SSTable writer testovi
-│       ├── stats.go                 # Stats strukture i snapshot podaci
-│       ├── store.go                 # Glavni Store API i lifecycle
-│       ├── store_backpressure_test.go
-│       ├── store_compact_test.go
-│       ├── store_flush_test.go
-│       ├── store_force_flush_test.go
-│       ├── store_read_path_test.go
-│       ├── store_test.go            # Core Store testovi
-│       ├── version.go               # Published SSTable Version view
-│       ├── wal.go                   # WAL segment lifecycle
-│       ├── wal_record.go            # WAL binary record encoding/decoding
-│       ├── wal_record_test.go       # WAL record testovi
-│       ├── wal_recovery.go          # WAL replay i torn-tail recovery
-│       └── wal_segment_test.go      # WAL segment testovi
-├── go.mod                           # Go module definicija
-├── HANDOFF.md                       # Development handoff beleške
-├── PROJECT_STATUS.md                # Status projekta
-└── README.md                        # Ovaj dokument
+N = 3  -> ReplicationFactor
+R = 2  -> ReadQuorum
+W = 2  -> WriteQuorum
 ```
 
-> `data/` je lokalni runtime direktorijum. WAL i SSTable fajlovi koji se generišu tokom rada ne treba da budu deo source-control istorije osim ako repo eksplicitno definiše drugačiji development workflow.
+Sa `N = 3`, `R = 2` i `W = 2` važi:
+
+```text
+R + W > N
+2 + 2 > 3
+```
+
+Read i write quorum se zato preklapaju u najmanje jednoj replici.
+
+Praktično:
+
+- `Put` uspeva kada dve replike potvrde upis.
+- `Get` uspeva kada dve replike odgovore.
+- `Delete` uspeva kada dve replike potvrde brisanje.
+- Jedan node može biti nedostupan, a osnovne operacije i dalje mogu uspeti ako su preostale dve potrebne replike dostupne.
+
+---
 
 ## Architecture
 
-Engine koristi Log-Structured Merge Tree pristup.
+```text
+                         Client
+                           |
+                           v
+                 Any cluster node via gRPC
+                           |
+                           v
+              Is this node the coordinator?
+                    |                 |
+                  yes                 no
+                    |                 |
+                    v                 v
+          Execute quorum flow    Forward request
+                    |
+                    v
+       Consistent hash ring / preference list
+                    |
+                    v
+      Replica 1       Replica 2       Replica 3
+          |               |               |
+          v               v               v
+    Local LSM Store  Local LSM Store  Local LSM Store
+```
+
+Svaki node sadrži jednu instancu lokalnog LSM storage engine-a i jednu instancu distribution layer-a.
+
+Distribution layer koristi storage layer samo kroz osnovne operacije:
+
+```text
+Get(key)
+Put(key, value)
+Delete(key)
+```
+
+LSM engine nema znanje o cluster membership-u, consistent hashing-u, replikaciji ili quorum pravilima.
+
+---
+
+## Coordinator and Preference List
+
+Za svaki ključ:
+
+1. Ključ se hash-uje na consistent-hashing ring.
+2. Prvi node u smeru kazaljke na satu postaje coordinator.
+3. Coordinator i narednih `N - 1` nodova čine preference list.
+4. Client request može doći na bilo koji node.
+5. Ako primljeni node nije coordinator, zahtev se prosleđuje coordinator-u.
+6. Coordinator kontaktira replike paralelno i vraća rezultat čim se dostigne potrebni quorum.
+
+```text
+key
+  -> hash(key)
+  -> coordinator
+  -> preference list of N replicas
+  -> parallel quorum requests
+  -> return when R or W acknowledgements are collected
+```
+
+---
+
+## Distributed Operation Flows
+
+### Quorum Put
+
+```text
+Client Put(key, value)
+  -> Any Node
+  -> Forward to coordinator if necessary
+  -> Coordinator resolves preference list
+  -> Coordinator sends write to replicas in parallel
+  -> Each replica writes to its local LSM store
+  -> Return success as soon as W acknowledgements arrive
+```
+
+Za `N = 3, W = 2`, write ne čeka treću repliku ako su dve replike već uspešno potvrdile operaciju.
+
+### Quorum Get
+
+```text
+Client Get(key)
+  -> Any Node
+  -> Forward to coordinator if necessary
+  -> Coordinator resolves preference list
+  -> Coordinator reads replicas in parallel
+  -> Return after R replica responses
+```
+
+Za `N = 3, R = 2`, read može uspeti dok je jedna replika nedostupna, ako dve potrebne replike odgovore.
+
+### Quorum Delete
+
+```text
+Client Delete(key)
+  -> Any Node
+  -> Forward to coordinator if necessary
+  -> Coordinator resolves preference list
+  -> Coordinator sends delete to replicas in parallel
+  -> Each replica performs local LSM delete
+  -> Return success as soon as W acknowledgements arrive
+```
+
+---
+
+## Local Storage Write Path
+
+Lokalni `Put` i `Delete` koriste durability-first redosled:
 
 ```text
 Put/Delete
   -> WAL append
-  -> WAL fsync prema konfiguraciji
+  -> WAL fsync according to configuration
   -> Active Memtable
   -> Memtable rotation
   -> Immutable Memtable
@@ -104,35 +214,26 @@ Put/Delete
   -> Background Compaction
 ```
 
-Read path traži podatke od najnovijeg ka najstarijem sloju:
+Redosled je ključan: acknowledged mutacija se prvo zapisuje u WAL, a zatim postaje vidljiva kroz memtable i kasnije SSTable slojeve.
+
+---
+
+## Local Storage Read Path
 
 ```text
 Get(key)
   -> Active Memtable
-  -> Immutable Memtables (newest first)
+  -> Immutable Memtables, newest first
   -> Current Version / SSTables
 ```
 
-Ako se tombstone pronađe u novijem sloju, lookup se završava kao `not found`, čak i ako stariji SSTable sadrži prethodnu vrednost.
+Ako se tombstone pronađe u novijem lokalnom storage sloju, lookup se završava kao `not found`, čak i ako stariji SSTable sadrži prethodnu vrednost.
 
-## Write Path
+---
 
-`Put` i `Delete` koriste durability-first redosled:
+## WAL and Recovery
 
-1. Validacija input-a i stanja store-a
-2. Provera write-stall/backpressure uslova
-3. Dodela sledećeg sequence broja
-4. Upis mutacije u WAL
-5. `fsync` prema `WALFsyncEveryN` konfiguraciji
-6. Upis u aktivni memtable
-7. Memtable rotacija kada se dostigne `MemtableMaxBytes`
-8. Background flush immutable memtable-a u SSTable
-
-Ovaj redosled je ključan: acknowledged mutacija je prvo zapisana u WAL, pa tek onda postaje vidljiva u memtable-u.
-
-## WAL
-
-Write-Ahead Log predstavlja prvi durability layer engine-a.
+Write-Ahead Log je prvi durability layer lokalnog engine-a.
 
 WAL podržava:
 
@@ -141,154 +242,82 @@ WAL podržava:
 - Header validation za postojeće segmente
 - Binary encode/decode WAL record-a
 - Checksum validation
-- Replay svih validnih zapisa pri restart-u
+- Replay validnih zapisa pri restart-u
 - Recovery nakon incomplete/torn final record-a
 - Bezbedno trunciranje nekompletnog tail-a
 
-WAL konfiguracija i postojeći segment header-i se validiraju pri otvaranju, tako da nevalidna konfiguracija ili korumpiran segment ne nastavljaju tiho kroz recovery path.
+Sa `WALFsyncEveryN = 1`, acknowledged lokalne `Put` i `Delete` mutacije imaju subprocess testove koji potvrđuju WAL recovery nakon naglog prekida procesa bez `Close()`.
 
-## Manifest
+Ova tvrdnja pokriva process-level crash recovery prema WAL fsync politici. Ne predstavlja apsolutnu garanciju za fizički nestanak struje, bug u filesystem-u ili kvar storage uređaja izvan granica koje OS i uređaj pružaju za `fsync`.
+
+---
+
+## Manifest and SSTables
 
 Manifest je authoritative source za live SSTable fajlove.
 
-SSTable nije deo aktivnog on-disk stanja samo zato što fajl postoji na disku. Tabela postaje live tek kada novi manifest bude uspešno objavljen.
+SSTable fajl postaje deo aktivnog on-disk stanja tek kada njegov metadata entry bude uspešno objavljen kroz novi manifest. Ako crash nastane između SSTable write/rename koraka i manifest publish-a:
 
-`loadManifest()` odbija korumpiran ili logički nevalidan manifest, uključujući:
+- stari manifest ostaje authoritative;
+- stari read state ostaje ispravan;
+- novi SSTable može ostati orphan fajl bez uticaja na read correctness.
 
-- Nepodržanu manifest verziju
-- Table entry sa `ID == 0`
-- Prazan `File`
-- Putanju izvan data direktorijuma, na primer `../some-file.sst`
-- Nevalidan sequence range, gde je `MinSeqNo > MaxSeqNo`
-- Negativan `FileSize`
-- Dupli table ID
-- Dupli table file path
+SSTable reader dodatno validira index blok i Bloom filter metadata kako korumpirani fajlovi ne bi izazvali pogrešan lookup ili runtime panic.
 
-Takva stanja vraćaju `ErrCorruptionDetected`. `manifest_test.go` proverava da validan manifest i dalje normalno prolazi, a nevalidni manifest-i budu odbijeni.
-
-## SSTables
-
-SSTable je immutable on-disk struktura nastala flush-ovanjem memtable-a.
-
-Relevantne komponente su:
-
-- `sstable_writer.go` — zapis podataka, blokova, index-a i Bloom metadata
-- `sstable_reader.go` — lookup i čitanje SSTable sadržaja
-- `sstable_reader_all_entries_test.go` — provera čitanja kompletnog sadržaja
-- `sstable_writer_test.go` i `sstable_reader_test.go` — writer/reader correctness testovi
-
-Reader dodatno validira SSTable index blok. Index se prihvata samo ako konzistentno deli data region fajla na uređene i validne blokove.
-
-Ova provera sprečava da korumpiran index navede reader da čita pogrešan deo fajla, vrati pogrešan `ErrNotFound`, prijavi nejasan I/O problem ili pogrešno interpretira podatke. Umesto toga, engine fail-fast vraća `ErrCorruptionDetected`.
-
-## Bloom Filter Validation
-
-Bloom filter se koristi kao read optimization pre detaljnog SSTable lookup-a.
-
-Bloom payload se prihvata samo ako važe sledeća pravila:
-
-- `m` nije nula
-- `m` je deljiv sa 8
-- `k` nije nula
-- Veličina bit-array-a je tačno `m / 8`
-
-Bez tih guard-a, korumpiran Bloom header može kasnije izazvati runtime panic, na primer modulo operaciju nad nulom. Cilj je da korupcija postane kontrolisani `ErrCorruptionDetected`, a ne pad servera.
-
-`bloom_test.go` pokriva ove validation scenarije.
-
-## Memtable, Flush and Scheduler
-
-Aktivni memtable prima nove mutacije dok ne dostigne `MemtableMaxBytes`.
-
-Kada se prag dostigne:
-
-1. Aktivni memtable postaje immutable.
-2. Novi aktivni memtable nastavlja da prima write-ove.
-3. Background scheduler flush-uje najstariji immutable memtable u SSTable.
-4. Novi SSTable se objavljuje kroz manifest.
-5. Novi `Version` postaje vidljiv read path-u.
-
-`scheduler_test.go` potvrđuje sledeće:
-
-- Više malih write-ova izazove memtable rotacije
-- Background flush worker zaista odradi posao
-- `ImmutablesCount` na kraju padne na `0`
-- Objavi se najmanje jedan SSTable
-- Svi upisani ključevi ostaju čitljivi
-
-Test pokazuje da scheduler ne zahteva dodatne izmene za trenutnu Phase A funkcionalnost.
+---
 
 ## Compaction
 
-Compaction smanjuje broj SSTable fajlova tako što bira kompatibilne tabele i merge-uje ih u novu SSTable strukturu.
+`lsmkv` trenutno koristi size-tiered compaction.
 
-Kod je podeljen na:
+Compaction:
 
-- `compaction_picker.go` — bira kandidatske SSTable fajlove
-- `compaction_merge.go` — merge logika
-- `compaction.go` — orchestration i publish koraci
+1. bira kompatibilne SSTable kandidate;
+2. merge-uje podatke po redosledu svežine;
+3. pravi novu SSTable;
+4. objavljuje rezultat kroz manifest;
+5. tek tada uklanja replaced tabele iz aktivnog version view-a.
 
-Compaction rezultat postaje live tek nakon uspešnog manifest publish-a. Ako crash nastane između SSTable write/rename koraka i manifest publish-a, stari manifest ostaje authoritative, a novonastali SSTable može ostati orphan fajl bez uticaja na read correctness.
+Tombstone zapisi u lokalnom LSM engine-u sprečavaju da starija vrednost ponovo postane vidljiva nakon lokalnog `Delete`.
 
-## Crash Recovery
+---
 
-Testovi pokrivaju više kategorija crash scenarija:
+## Project Structure
 
-- Crash između SSTable rename-a i manifest publish-a
-- Crash tokom compaction-a pre manifest publish-a
-- Torn/truncated WAL tail
-- Restart u prisustvu orphan SSTable fajla
-- Hard process crash nakon acknowledged `Put`
-- Hard process crash nakon acknowledged `Delete`
+```text
+lsmkv-github/
+├── cmd/
+│   ├── lsmkv/
+│   │   └── main.go                  # Lokalni CLI / application entrypoint
+│   └── server/
+│       └── main.go                  # gRPC node server entrypoint
+├── config/
+│   └── default.json                 # Podrazumevana storage konfiguracija
+├── internal/
+│   ├── coordinator/                 # Coordinator i quorum-related logika
+│   ├── lsm/                         # Single-node durable LSM storage engine
+│   ├── node/                        # gRPC node runtime, forwarding i replication
+│   └── ring/                        # Consistent hashing ring i preference list
+├── proto/                           # Protobuf / generated gRPC definicije
+├── go.mod
+└── README.md
+```
 
-### Hard Crash After Put
+Najvažniji paketi:
 
-`TestHardCrashAfterAcknowledgedPutsRecoverFromWAL` koristi child process koji:
+| Package | Odgovornost |
+|---|---|
+| `internal/lsm` | WAL, memtable, SSTables, manifest, flush, compaction, recovery |
+| `internal/ring` | Hash ring, virtual nodes i preference-list izbor |
+| `internal/coordinator` | Coordinator odluke i quorum konfiguracija |
+| `internal/node` | gRPC server/client, request forwarding, quorum fan-out i local storage integracija |
+| `proto` | RPC ugovori između client-a i node-ova |
+| `cmd/server` | Pokretanje jednog cluster noda |
+| `cmd/lsmkv` | Lokalni CLI / storage entrypoint |
 
-1. Otvara store sa `WALFsyncEveryN = 1`
-2. Koristi veliki `MemtableMaxBytes`, pa se flush ne dešava
-3. Uspešno izvršava `Put` operacije
-4. Završava preko `os.Exit(0)` bez `store.Close()`
+> Runtime data direktorijumi, WAL segmenti i SSTable fajlovi ne treba da budu deo source-control istorije.
 
-Parent process zatim ponovo otvara isti data direktorijum i potvrđuje da su acknowledged vrednosti obnovljene WAL replay-om.
-
-Ovaj test direktno dokazuje da fsync-ovani acknowledged `Put` zapisi prežive nagli prekid procesa.
-
-### Hard Crash After Delete
-
-`TestHardCrashAfterAcknowledgedDeleteRecoversTombstone` koristi child process koji:
-
-1. Otvara store sa `WALFsyncEveryN = 1`
-2. Izvršava `Put("gone", "value")`
-3. Izvršava `Delete("gone")`
-4. Završava preko `os.Exit(0)` bez `store.Close()`
-
-Nakon restart-a, parent process replay-uje WAL i proverava da `Get("gone")` vraća `found == false`.
-
-Ovaj test dokazuje durability tombstone-a, odnosno da potvrđeno brisanje ne može vratiti staru vrednost nakon process crash-a.
-
-## Store Lifecycle
-
-`Store` podržava sledeće lifecycle putanje:
-
-- `Open()` — učitava manifest, otvara SSTable reader-e, otvara WAL i replay-uje WAL zapise
-- `ForceFlush()` — sinhrono flush-uje aktivne/pending podatke kada je potreban eksplicitan durability korak u SSTable sloj
-- `Close()` / graceful close — zaustavlja background rad i završava pending flush putanju
-- `CloseFast()` — zatvara engine bez čekanja da se svi pending immutable memtable-i flush-uju
-
-Nakon reopen-a, engine kombinuje manifest state i WAL replay da bi obnovio najnovije validno stanje.
-
-## Error Handling
-
-Engine koristi sentinel greške za jasnije razlikovanje failure kategorija:
-
-- `ErrInvalidArgument` — nevalidan input ili config
-- `ErrStoreClosed` — operacija nad zatvorenim store-om
-- `ErrNotFound` — ključ ne postoji u storage slojevima
-- `ErrCorruptionDetected` — korumpiran WAL, manifest, SSTable metadata ili Bloom metadata
-- `ErrIOFailure` — I/O failure tokom storage operacije
-- `ErrTooManyImmutables` — previše pending immutable memtable-a
-- `ErrWriteStall` — write je odbijen zbog L0/backpressure limita
+---
 
 ## Tests
 
@@ -298,12 +327,20 @@ Pokreni kompletnu test suite iz root direktorijuma:
 go test -count=1 ./...
 ```
 
+Za standardni brži run:
+
+```bash
+go test ./...
+```
+
 Test suite pokriva:
+
+### Storage Engine
 
 - Config defaults i validation
 - WAL record encoding/decoding
 - WAL segment lifecycle
-- WAL recovery
+- WAL replay i torn-tail recovery
 - Basic Store behavior
 - Read path behavior
 - Flush behavior
@@ -314,17 +351,114 @@ Test suite pokriva:
 - Bloom filter validation
 - Manifest structural validation
 - Background scheduler behavior
-- Crash injection scenarios
+- Crash injection scenarije
 - Hard-crash durability za `Put` i `Delete`
 
-## Durability Scope
+### Distribution Layer
 
-Sa `WALFsyncEveryN = 1`, acknowledged `Put` i `Delete` mutacije imaju konkretne subprocess testove koji potvrđuju WAL recovery nakon naglog prekida procesa bez `Close()`.
+- Consistent hash ring ponašanje
+- Preference list i coordinator izbor
+- gRPC request forwarding
+- Quorum replication u healthy 3-node cluster-u
+- Quorum `Get` u healthy cluster-u
+- Replicated `Delete` u healthy cluster-u
+- Read quorum sa jednom ugašenom replikom
+- Write quorum sa jednom ugašenom replikom
+- Delete quorum sa jednom ugašenom replikom
 
-Ta tvrdnja pokriva process-level crash recovery prema WAL fsync politici. Ne predstavlja apsolutnu garanciju za fizički nestanak struje, bug u filesystem-u ili kvar storage uređaja izvan granica koje OS i uređaj pružaju za `fsync`.
+---
+
+## Tested Failure Behavior
+
+Za `N = 3`, `R = 2`, `W = 2`, integration testovi potvrđuju:
+
+| Scenario | Expected result |
+|---|---|
+| Sve tri replike su dostupne | `Put`, `Get` i `Delete` rade kroz quorum flow |
+| Jedna replika je down tokom `Put` | Write uspeva sa dve dostupne quorum potvrde |
+| Jedna replika je down tokom `Get` | Read uspeva sa odgovorima dve dostupne replike |
+| Jedna replika je down tokom `Delete` | Delete uspeva sa dve dostupne quorum potvrde |
+| Lokalni proces se prekine posle acknowledged mutacije | WAL replay obnavlja acknowledged lokalno stanje |
+
+---
+
+## Current Scope and Limitations
+
+Ovo je funkcionalan Dynamo-inspired quorum MVP, ali nije kompletna produkcijska Dynamo/Cassandra implementacija.
+
+Svesno nisu implementirani:
+
+- Dynamic cluster membership
+- Heartbeat failure detector i gossip membership
+- Node join/leave data migration i automatic rebalance
+- Sloppy quorum
+- Hinted handoff
+- Read repair
+- Anti-entropy repair
+- Merkle trees
+- Vector clocks
+- Sibling values za concurrent writes
+- Conflict resolution između divergentnih verzija
+- Distributed tombstones
+- Replica catch-up nakon node recovery-ja
+- TLS, authentication i authorization
+- Prometheus metrics endpoint
+- Distributed tracing i production observability
+- Chaos test harness za kontinuirane kill/restart scenarije
+
+### Important Delete Limitation
+
+Lokalni storage engine koristi tombstone zapise i lokalni delete je crash-safe.
+
+Međutim, distribucioni `Delete` trenutno nema **distributed tombstone**, hinted handoff ili repair mehanizam.
+
+To znači:
+
+1. Ako su sve replike dostupne, delete se propagira na sve replike.
+2. Ako je jedna replika nedostupna, delete može uspešno završiti sa `W = 2`.
+3. Nedostupna replika može propustiti delete i zadržati staru vrednost.
+4. Kada se vrati, sistem trenutno nema automatski repair koji bi je uskladio.
+
+Ovo ograničenje je poznato i namerno ostavljeno za naprednu narednu fazu. Produkcijski sistemi rešavaju ovaj slučaj kombinacijom distributed tombstone-a, hinted handoff-a, verzionisanja i anti-entropy repair-a.
+
+---
 
 ## Current Status
 
-Phase A, single-node LSM key-value engine, ima implementirane osnovne write/read/storage/recovery tokove i ciljane testove za durability i corruption handling.
+### Completed
 
-Jedina eksplicitno odložena stavka je potencijalna concurrency provera u `version.go`: standardni build i testovi prolaze, dok je race-oriented verifikacija trenutno ograničena Windows toolchain okruženjem.
+- Stabilan single-node LSM storage engine
+- WAL durability i crash recovery
+- Memtable, SSTables, manifest i size-tiered compaction
+- Corruption validation za ključne on-disk strukture
+- gRPC node komunikacija
+- Static multi-node cluster konfiguracija
+- Consistent hashing i virtual nodes
+- Coordinator routing i request forwarding
+- Replication factor `N`
+- Read quorum `R`
+- Write quorum `W`
+- Quorum `Put`, `Get` i `Delete`
+- Early-return quorum behavior
+- Healthy i one-node-down integration testovi
+
+### Deferred Advanced Work
+
+- Hinted handoff i sloppy quorum
+- Heartbeat/gossip membership
+- Vector clocks, siblings i conflict resolution
+- Anti-entropy repair preko Merkle trees
+- Dynamic membership i data rebalance
+- Distributed delete correctness kroz tombstones i repair
+- Metrics, tracing, chaos testing i production hardening
+
+---
+
+## Design Goal
+
+Cilj projekta je da jasno i testabilno demonstrira dva važna sistema:
+
+- kako durable LSM storage engine čuva podatke kroz WAL, memtable, SSTable i compaction tok;
+- kako Dynamo-style distribution layer koristi consistent hashing, replication i quorum pravila da održi dostupnost osnovnih operacija kada jedan node nije dostupan.
+
+Trenutni rezultat je namerno ograničen, ali kompletan i objašnjiv distributed storage MVP: dovoljno realan da demonstrira glavne distributed-systems ideje, a dovoljno mali da ostane razumljiv, održiv i testabilan.
