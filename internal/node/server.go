@@ -12,12 +12,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// Server implementira KVService gRPC API nad lokalnim LSM store-om i cluster runtime-om.
 type Server struct {
 	lsmkvv1.UnimplementedKVServiceServer
 	store *lsm.Store
 	rt    *Runtime
 }
 
+// NewServer pravi gRPC handler koji koristi lokalni storage i informacije o cluster-u.
 func NewServer(store *lsm.Store, rt *Runtime) *Server {
 	return &Server{
 		store: store,
@@ -25,6 +27,8 @@ func NewServer(store *lsm.Store, rt *Runtime) *Server {
 	}
 }
 
+// Put validira zahtev, po potrebi ga prosleđuje coordinator-u, a zatim pokreće
+// lokalni upis ili write replication za spoljne zahteve.
 func (s *Server) Put(ctx context.Context, req *lsmkvv1.PutRequest) (*lsmkvv1.PutResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
@@ -44,12 +48,14 @@ func (s *Server) Put(ctx context.Context, req *lsmkvv1.PutRequest) (*lsmkvv1.Put
 	}
 
 	if req.Forwarded {
+		// Coordinator prima već rutiran zahtev i primenjuje lokalnu kopiju bez novog forwarding-a.
 		if err := s.store.Put(req.Key, req.Value); err != nil {
 			return nil, toGRPCError(err)
 		}
 		return &lsmkvv1.PutResponse{}, nil
 	}
 
+	// Spoljni zahtev na coordinator-u pokreće write quorum prema replica set-u.
 	if err := s.replicatePut(ctx, req.Key, req.Value); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -57,6 +63,8 @@ func (s *Server) Put(ctx context.Context, req *lsmkvv1.PutRequest) (*lsmkvv1.Put
 	return &lsmkvv1.PutResponse{}, nil
 }
 
+// Get validira zahtev, po potrebi ga prosleđuje coordinator-u, a zatim izvršava
+// lokalni read ili read quorum za spoljne zahteve.
 func (s *Server) Get(ctx context.Context, req *lsmkvv1.GetRequest) (*lsmkvv1.GetResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
@@ -76,6 +84,7 @@ func (s *Server) Get(ctx context.Context, req *lsmkvv1.GetRequest) (*lsmkvv1.Get
 	}
 
 	if req.Forwarded {
+		// Interno prosleđen read služi kao pojedinačno čitanje sa coordinator noda.
 		value, found, err := s.store.Get(req.Key)
 		if err != nil {
 			return nil, toGRPCError(err)
@@ -87,6 +96,7 @@ func (s *Server) Get(ctx context.Context, req *lsmkvv1.GetRequest) (*lsmkvv1.Get
 		return &lsmkvv1.GetResponse{Value: value}, nil
 	}
 
+	// Spoljni zahtev na coordinator-u prikuplja odgovore iz replica set-a.
 	value, err := s.replicateGet(ctx, req.Key)
 	if err != nil {
 		return nil, err
@@ -95,6 +105,8 @@ func (s *Server) Get(ctx context.Context, req *lsmkvv1.GetRequest) (*lsmkvv1.Get
 	return &lsmkvv1.GetResponse{Value: value}, nil
 }
 
+// Delete validira zahtev, po potrebi ga prosleđuje coordinator-u, a zatim lokalno
+// upisuje tombstone ili pokreće delete quorum za spoljne zahteve.
 func (s *Server) Delete(ctx context.Context, req *lsmkvv1.DeleteRequest) (*lsmkvv1.DeleteResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
@@ -114,6 +126,7 @@ func (s *Server) Delete(ctx context.Context, req *lsmkvv1.DeleteRequest) (*lsmkv
 	}
 
 	if req.Forwarded {
+		// Lokalni LSM Delete čuva tombstone koji kasnije sakriva starije vrednosti.
 		if err := s.store.Delete(req.Key); err != nil {
 			return nil, toGRPCError(err)
 		}
@@ -127,6 +140,7 @@ func (s *Server) Delete(ctx context.Context, req *lsmkvv1.DeleteRequest) (*lsmkv
 	return &lsmkvv1.DeleteResponse{}, nil
 }
 
+// forwardPutIfNeeded prosleđuje spoljašnji Put samo kada lokalni node nije coordinator.
 func (s *Server) forwardPutIfNeeded(ctx context.Context, req *lsmkvv1.PutRequest) (bool, error) {
 	target, shouldForward, err := s.forwardTarget(req.Key)
 	if err != nil {
@@ -148,6 +162,7 @@ func (s *Server) forwardPutIfNeeded(ctx context.Context, req *lsmkvv1.PutRequest
 	return true, nil
 }
 
+// forwardGetIfNeeded vraća odgovor sa coordinator noda kada lokalni node nije odgovoran za key.
 func (s *Server) forwardGetIfNeeded(ctx context.Context, req *lsmkvv1.GetRequest) (*lsmkvv1.GetResponse, bool, error) {
 	target, shouldForward, err := s.forwardTarget(req.Key)
 	if err != nil {
@@ -170,6 +185,7 @@ func (s *Server) forwardGetIfNeeded(ctx context.Context, req *lsmkvv1.GetRequest
 	return &lsmkvv1.GetResponse{Value: value}, true, nil
 }
 
+// forwardDeleteIfNeeded prosleđuje spoljašnji Delete samo kada lokalni node nije coordinator.
 func (s *Server) forwardDeleteIfNeeded(ctx context.Context, req *lsmkvv1.DeleteRequest) (bool, error) {
 	target, shouldForward, err := s.forwardTarget(req.Key)
 	if err != nil {
@@ -191,7 +207,9 @@ func (s *Server) forwardDeleteIfNeeded(ctx context.Context, req *lsmkvv1.DeleteR
 	return true, nil
 }
 
+// forwardTarget vraća coordinator node i odluku da li zahtev treba poslati drugom node-u.
 func (s *Server) forwardTarget(key []byte) (ring.Node, bool, error) {
+	// Bez runtime-a server radi kao lokalni single-node handler.
 	if s.rt == nil || s.rt.Coordinator == nil {
 		return ring.Node{}, false, nil
 	}
@@ -211,6 +229,7 @@ func (s *Server) forwardTarget(key []byte) (ring.Node, bool, error) {
 	return target, true, nil
 }
 
+// toGRPCError prevodi interne LSM greške u gRPC status kodove koje client može tumačiti.
 func toGRPCError(err error) error {
 	switch {
 	case err == nil:

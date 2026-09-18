@@ -10,37 +10,47 @@ import (
 	"time"
 )
 
+// Store objedinjuje aktivni memtable, WAL, SSTable fajlove i pozadinske poslove
+// za jednu lokalnu LSM bazu.
 type Store struct {
 	cfg    Config
 	closed bool
 	stats  Stats
 
+	// mu štiti stanje koje dele foreground operacije i background worker-i.
 	mu sync.RWMutex
 
-	wal        *WAL
-	mem        *Memtable
+	// WAL čuva potvrđene upise dok ne postanu deo SSTable-a.
+	wal *WAL
+	// mem prima nove upise i prvi se proverava na čitanju.
+	mem *Memtable
+	// immutables sadrži rotirane memtable-ove koji čekaju flush na disk.
 	immutables []*Memtable
-	seqNo      uint64
-	version    *Version
-	manifest   *Manifest
+	// seqNo određuje redosled verzija istog ključa.
+	seqNo    uint64
+	version  *Version
+	manifest *Manifest
 
-	// bg owns flush/compaction workers. Started in Open, stopped in Close.
+	// bg upravlja flush/compaction worker-ima. Kreira se u Open, gasi u Close.
 	bg *scheduler
 
-	// lastBGError is the most recent background worker failure, if any.
+	// lastBGError čuva poslednju grešku iz background worker-a.
 	lastBGError error
 
-	// Unit 8: metrics and structured logger.
+	// metrics i log služe za praćenje rada engine-a.
 	metrics Metrics
 	log     *slog.Logger
 }
 
+// Open vraća store u poslednje konzistentno stanje: učitava manifest i SSTable-ove,
+// a zatim replay-uje WAL zapise koji još nisu završili na disku.
 func Open(cfg Config) (*Store, error) {
 	manifest, err := loadManifest(cfg)
 	if err != nil {
 		return nil, err
 	}
 
+	// Otvaramo sve tabele iz manifesta pre nego što objavimo početnu verziju.
 	readers := make([]*SSTableReader, 0, len(manifest.Tables))
 	for _, t := range manifest.Tables {
 		r, err := OpenSSTableReader(filepath.Join(cfg.DataDir, t.File))
@@ -61,6 +71,7 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
+	// WAL sadrži novije upise koji nisu nužno stigli do SSTable-a.
 	records, err := ReplayWAL(cfg)
 	if err != nil {
 		_ = wal.Close()
@@ -83,7 +94,7 @@ func Open(cfg Config) (*Store, error) {
 		}
 	}
 
-	// Preserve highest seq already durable in SSTables after flush/reopen.
+	// SeqNo ne sme da ide unazad ni kada je WAL već očišćen nakon flush-a.
 	for _, t := range manifest.Tables {
 		if t.MaxSeqNo > maxSeq {
 			maxSeq = t.MaxSeqNo
@@ -108,6 +119,8 @@ func Open(cfg Config) (*Store, error) {
 	return store, nil
 }
 
+// Put prvo trajno upisuje zapis u WAL, pa tek onda ažurira aktivni memtable.
+// Tako uspešan upis može da se oporavi i ako proces padne pre flush-a.
 func (s *Store) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrInvalidArgument
@@ -136,6 +149,8 @@ func (s *Store) Put(key, value []byte) error {
 	return s.rotateIfNeededLocked()
 }
 
+// Get traži noviju verziju pre starije: aktivni memtable, immutable memtable-ovi,
+// pa SSTable-ovi. Tombstone prekida pretragu jer briše sve starije vrednosti.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	if len(key) == 0 {
 		return nil, false, ErrInvalidArgument
@@ -155,6 +170,7 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 		return value, true, nil
 	}
 
+	// Noviji immutable memtable-ovi su na kraju niza, zato idemo unazad.
 	for i := len(s.immutables) - 1; i >= 0; i-- {
 		if value, tombstone, found := s.immutables[i].Get(key); found {
 			if tombstone {
@@ -178,6 +194,8 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	return entry.value, true, nil
 }
 
+// Delete upisuje tombstone umesto da odmah ukloni stare vrednosti sa diska.
+// Stare vrednosti i tombstone kasnije obrađuje compaction.
 func (s *Store) Delete(key []byte) error {
 	if len(key) == 0 {
 		return ErrInvalidArgument
@@ -206,10 +224,13 @@ func (s *Store) Delete(key []byte) error {
 	return s.rotateIfNeededLocked()
 }
 
+// checkWriteStallLocked zaustavlja nove upise kada broj SSTable-a pređe limit.
+// To je zaštita kada compaction ne stiže da smanji broj fajlova na vreme.
 func (s *Store) checkWriteStallLocked() error {
 	if s.cfg.L0StopWrites <= 0 {
 		return nil
 	}
+
 	n := 0
 	if s.version != nil {
 		n = len(s.version.SSTables)
@@ -224,11 +245,14 @@ func (s *Store) checkWriteStallLocked() error {
 	return nil
 }
 
+// rotateIfNeededLocked zamrzava pun aktivni memtable i zakazuje njegov flush.
+// Caller već mora da drži s.mu za pisanje.
 func (s *Store) rotateIfNeededLocked() error {
 	if s.mem.Bytes() < int64(s.cfg.MemtableMaxBytes) {
 		return nil
 	}
 
+	// Ne prihvatamo dalje upise ako flush zaostaje i troši previše memorije.
 	if s.cfg.MaxImmutableTables > 0 && len(s.immutables) >= s.cfg.MaxImmutableTables {
 		return ErrTooManyImmutables
 	}
@@ -247,6 +271,7 @@ func (s *Store) rotateIfNeededLocked() error {
 	return nil
 }
 
+// flushPendingImmutables prazni immutable red od najstarijeg ka najnovijem.
 func (s *Store) flushPendingImmutables() error {
 	for {
 		s.mu.Lock()
@@ -266,6 +291,8 @@ func (s *Store) flushPendingImmutables() error {
 	}
 }
 
+// flushOldestImmutableLocked pretvara najstariji immutable memtable u SSTable.
+// Nova tabela postaje vidljiva tek kada je njen zapis uspešno sačuvan u manifestu.
 func (s *Store) flushOldestImmutableLocked() error {
 	if len(s.immutables) == 0 {
 		return nil
@@ -284,6 +311,7 @@ func (s *Store) flushOldestImmutableLocked() error {
 	filename := fmt.Sprintf("%06d.sst", id)
 	path := filepath.Join(s.cfg.DataDir, filename)
 
+	// Memtable vraća sortirane zapise, što SSTable writer očekuje kao ulaz.
 	w := NewSSTableWriter(s.cfg)
 	for _, e := range entries {
 		w.Add(e.key, e.value, e.seqNo, e.tombstone)
@@ -319,6 +347,7 @@ func (s *Store) flushOldestImmutableLocked() error {
 		FileSize: fi.Size(),
 	}
 
+	// Manifest je trajni izvor istine o SSTable fajlovima koji pripadaju store-u.
 	newManifest := s.manifest.withNewTable(info)
 	if err := saveManifest(s.cfg, newManifest); err != nil {
 		return fmt.Errorf("save manifest after flush: %w", err)
@@ -329,17 +358,18 @@ func (s *Store) flushOldestImmutableLocked() error {
 		return fmt.Errorf("open freshly flushed sstable: %w", err)
 	}
 
+	// Tek sada je tabela i na disku i evidentirana u manifestu, pa je objavljujemo.
 	s.version = s.version.withPublishedFlush(reader, newManifest.Epoch)
 	s.manifest = newManifest
 	s.immutables = s.immutables[1:]
 
+	// WAL se resetuje samo kada više nema podataka koji čekaju flush.
 	if len(s.immutables) == 0 && s.mem.Len() == 0 {
 		if err := s.wal.Reset(); err != nil {
 			return fmt.Errorf("reset wal after flush: %w", err)
 		}
 	}
 
-	// Metrics + log AFTER publish — nikad između rename i manifest save.
 	durMs := time.Since(start).Milliseconds()
 	s.metrics.FlushesTotal.Add(1)
 	s.metrics.LastFlushDurationMs.Store(durMs)
@@ -353,6 +383,8 @@ func (s *Store) flushOldestImmutableLocked() error {
 	return nil
 }
 
+// Compact pokreće jedno spajanje SSTable-a kada compaction policy pronađe posao.
+// Compaction se preskače dok postoje immutable memtable-ovi koji čekaju flush.
 func (s *Store) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -365,8 +397,6 @@ func (s *Store) Compact() error {
 		return nil
 	}
 
-	// Stari potpis: runCompactionOnce(s.cfg, s.manifest)
-	// Novi potpis (Unit 8): proslijeđujemo metrics i logger
 	nextManifest, err := runCompactionOnce(s.cfg, s.manifest, &s.metrics, s.log)
 	if err != nil {
 		return err
@@ -375,6 +405,7 @@ func (s *Store) Compact() error {
 		return nil
 	}
 
+	// Nova verzija mora imati readere za ceo skup tabela iz novog manifesta.
 	readers := make([]*SSTableReader, 0, len(nextManifest.Tables))
 	for _, table := range nextManifest.Tables {
 		reader, err := OpenSSTableReader(filepath.Join(s.cfg.DataDir, table.File))
@@ -397,6 +428,8 @@ func (s *Store) Compact() error {
 	return nil
 }
 
+// ForceFlush rotira aktivni memtable, čak i ako nije pun, i sinhrono flush-uje
+// sve immutable memtable-ove. Korisno je za testove i kontrolisano gašenje.
 func (s *Store) ForceFlush() error {
 	s.mu.Lock()
 	if s.closed {
@@ -412,6 +445,8 @@ func (s *Store) ForceFlush() error {
 	return s.flushPendingImmutables()
 }
 
+// rotateActiveIfNonEmptyLocked rotira aktivni memtable bez obzira na njegovu veličinu.
+// Caller već mora da drži s.mu za pisanje.
 func (s *Store) rotateActiveIfNonEmptyLocked() error {
 	if s.mem.Len() == 0 {
 		return nil
@@ -424,10 +459,12 @@ func (s *Store) rotateActiveIfNonEmptyLocked() error {
 	return nil
 }
 
+// FlushAll sinhrono flush-uje samo memtable-ove koji su već immutable.
 func (s *Store) FlushAll() error {
 	return s.flushPendingImmutables()
 }
 
+// Stats vraća konzistentan snapshot stanja store-a i trenutnih metrika.
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -460,12 +497,11 @@ func (s *Store) Stats() Stats {
 		s.stats.EngineStatus = "open"
 	}
 
-	// Unit 8: prikvači metrics snapshot.
 	s.stats.Metrics = s.metrics.Snapshot()
-
 	return s.stats
 }
 
+// BGStatus vraća trenutno stanje background flush/compaction scheduler-a.
 func (s *Store) BGStatus() BGStatus {
 	if s.bg == nil {
 		return BGStatus{}
@@ -473,34 +509,39 @@ func (s *Store) BGStatus() BGStatus {
 	return s.bg.status()
 }
 
-// MetricsSnapshot returns a point-in-time snapshot of all engine counters.
-// Lightweight — samo atomic loads, bez locka.
+// MetricsSnapshot vraća trenutni snapshot brojača bez uzimanja Store lock-a.
 func (s *Store) MetricsSnapshot() MetricsSnapshot {
 	return s.metrics.Snapshot()
 }
 
-func (s *Store) liveSSTCountLocked() int { //dodato - Stara stavka: helper funkcije koje same uzimaju RLock, pa se pozivaju iz scheduler toka bez jasne kontrole nad lock granicama.
-	if s.version == nil { //dodato - Nova stavka: locked i unlocked varijante, tako da caller odlučuje da li je lock već uzet i izbegava nested RLock obrazac.
+// liveSSTCountLocked vraća broj objavljenih SSTable-a. Caller već drži s.mu.
+func (s *Store) liveSSTCountLocked() int {
+	if s.version == nil {
 		return 0
 	}
 	return len(s.version.SSTables)
 }
 
+// immutableCountLocked vraća broj memtable-ova koji čekaju flush. Caller drži s.mu.
 func (s *Store) immutableCountLocked() int {
 	return len(s.immutables)
 }
+
+// liveSSTCount uzima read lock za callere koji već nemaju Store lock.
 func (s *Store) liveSSTCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.liveSSTCountLocked()
 }
 
+// immutableCount uzima read lock za callere koji već nemaju Store lock.
 func (s *Store) immutableCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.immutableCountLocked()
 }
 
+// recordBackgroundError čuva poslednju grešku iz asinhronog posla za Stats().
 func (s *Store) recordBackgroundError(op string, err error) {
 	if err == nil {
 		return
@@ -510,10 +551,13 @@ func (s *Store) recordBackgroundError(op string, err error) {
 	s.lastBGError = fmt.Errorf("%s: %w", op, err)
 }
 
+// Close koristi graceful shutdown kao podrazumevano ponašanje.
 func (s *Store) Close() error {
 	return s.CloseGraceful()
 }
 
+// CloseGraceful gasi worker-e, flush-uje immutable memtable-ove, a zatim zatvara
+// WAL i SSTable readere. Aktivni memtable ostaje bezbedan jer je pokriven WAL-om.
 func (s *Store) CloseGraceful() error {
 	if s.bg != nil {
 		s.bg.stopGraceful()
@@ -521,6 +565,8 @@ func (s *Store) CloseGraceful() error {
 	return s.finishClose(true)
 }
 
+// CloseFast gasi worker-e i zatvara fajlove bez čekanja da se immutable tabele flush-uju.
+// Neupisani podaci ostaju dostupni za recovery kroz WAL.
 func (s *Store) CloseFast() error {
 	if s.bg != nil {
 		s.bg.stopFast()
@@ -528,6 +574,7 @@ func (s *Store) CloseFast() error {
 	return s.finishClose(false)
 }
 
+// finishClose zatvara resurse nakon što su background worker-i zaustavljeni.
 func (s *Store) finishClose(drainImmutables bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

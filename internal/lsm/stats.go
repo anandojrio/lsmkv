@@ -1,10 +1,9 @@
 package lsm
 
-// Stats is a point-in-time snapshot of store state returned by Store.Stats().
-// It combines structural engine state (memtable, WAL, SSTs) with the
-// cumulative metrics counters from Metrics.Snapshot().
+// Stats je snapshot stanja store-a koji vraća Store.Stats().
+// Kombinuje trenutno strukturno stanje engine-a sa kumulativnim Metrics brojačima.
 type Stats struct {
-	// Engine lifecycle
+	// Lifecycle engine-a
 	EngineStatus string
 
 	// WAL
@@ -12,19 +11,19 @@ type Stats struct {
 	BytesWritten     int64
 	TotalWALSegments int
 
-	// Memtable
+	// Aktivni memtable
 	LastSeqNo     uint64
 	ActiveEntries int
 	ActiveBytes   int64
 
-	// Immutables
+	// Rotirani memtable-ovi koji čekaju flush
 	ImmutablesCount int
 	ImmutablesBytes int64
 
-	// SSTables
+	// Live SSTable fajlovi iz trenutnog manifesta/version-a
 	SSTCount      int
 	SSTTotalBytes int64
 
-	// Metrics snapshot (Unit 8)
+	// Kumulativni brojači od otvaranja store-a.
 	Metrics MetricsSnapshot
 }

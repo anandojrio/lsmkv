@@ -20,6 +20,7 @@ const (
 	defaultRPCTimeout  = 5 * time.Second
 )
 
+// flags sadrži argumente koje put/get/delete komande dele.
 type flags struct {
 	Addr     string
 	Key      string
@@ -28,6 +29,7 @@ type flags struct {
 	ValueSet bool
 }
 
+// main bira CLI komandu i prosleđuje ostatak argumenata njenom handler-u.
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -51,6 +53,7 @@ func main() {
 	}
 }
 
+// runPut šalje Put RPC odabranom node-u i čeka najviše defaultRPCTimeout.
 func runPut(args []string) {
 	f := mustParseFlags(args, true, true)
 
@@ -70,6 +73,7 @@ func runPut(args []string) {
 	fmt.Printf("ok put addr=%s key=%q\n", f.Addr, f.Key)
 }
 
+// runGet šalje Get RPC i prikazuje NOT FOUND kao regularan rezultat pretrage.
 func runGet(args []string) {
 	f := mustParseFlags(args, true, false)
 
@@ -94,6 +98,7 @@ func runGet(args []string) {
 	fmt.Println(string(value))
 }
 
+// runDelete šalje Delete RPC; server zatim primenjuje lokalni delete i/ili quorum logiku.
 func runDelete(args []string) {
 	f := mustParseFlags(args, true, false)
 
@@ -113,6 +118,8 @@ func runDelete(args []string) {
 	fmt.Printf("ok delete addr=%s key=%q\n", f.Addr, f.Key)
 }
 
+// mustParseFlags parsira podržane long flag-ove i prekida program sa jasnom porukom
+// kada nedostaje obavezni argument ili se pojavi nepoznat flag.
 func mustParseFlags(args []string, requireKey, requireValue bool) flags {
 	f := flags{
 		Addr: defaultAddr,
@@ -174,6 +181,7 @@ func mustParseFlags(args []string, requireKey, requireValue bool) flags {
 	return f
 }
 
+// nextFlagValue vraća sledeći argument i pomera indeks preko već iskorišćene vrednosti.
 func nextFlagValue(args []string, index *int, name string) string {
 	nextIndex := *index + 1
 
@@ -190,17 +198,19 @@ func nextFlagValue(args []string, index *int, name string) string {
 	return value
 }
 
+// fatalf ispisuje CLI grešku na stderr i završava proces neuspešnim exit kodom.
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
 }
 
+// printUsage prikazuje podržane komande i njihov osnovni format.
 func printUsage() {
 	exe := filepath.Base(os.Args[0])
 
 	fmt.Println("usage:")
 	fmt.Printf("  %s put --addr HOST:PORT --key K --value V\n", exe)
 	fmt.Printf("  %s get --addr HOST:PORT --key K\n", exe)
-	fmt.Printf("  %s delete --addr HOST:PORT --key K\n", exe)
+	fmt.Printf("  %s del|delete --addr HOST:PORT --key K\n", exe)
 	fmt.Printf("  %s help\n", exe)
 }

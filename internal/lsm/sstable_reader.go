@@ -10,21 +10,20 @@ import (
 	"sort"
 )
 
-// SSTableReader opens an SSTable file and provides point lookups.
-// It is safe to keep open across multiple Get calls.
+// SSTableReader učitava metadata SSTable-a u memoriju i omogućava point lookup.
+// Data blokovi ostaju na disku i čitaju se tek kada su potrebni.
 type SSTableReader struct {
 	path        string
-	index       []sstIndexEntry // in-memory index loaded once at open
-	bloom       *bloomFilter    // in-memory bloom filter loaded once at open
-	size        int64           // total file size in bytes
+	index       []sstIndexEntry
+	bloom       *bloomFilter
+	size        int64
 	indexOffset int64
 
-	// Unit 8: wired by version.Get; nil means no metrics collection.
+	// metrics postavlja Version.Get; nil znači da se metrike ne prikupljaju.
 	metrics *Metrics
 }
 
-// OpenSSTableReader opens the file, reads the footer, loads the index and
-// bloom filter into memory. Data blocks are NOT loaded — they stay on disk.
+// OpenSSTableReader učitava footer, bloom filter i indeks, ali ne učitava data blokove.
 func OpenSSTableReader(path string) (*SSTableReader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -32,7 +31,6 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	}
 	defer f.Close()
 
-	// 1. Determine file size.
 	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat sst: %w", err)
@@ -42,7 +40,7 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 		return nil, fmt.Errorf("sst file too small (%d bytes): %w", size, ErrCorruptionDetected)
 	}
 
-	// 2. Read FOOTER — always the last 16 bytes.
+	// Footer je poslednjih 16 bajtova: indexOffset pa bloomOffset.
 	footer := make([]byte, 16)
 	if _, err := f.ReadAt(footer, size-16); err != nil {
 		return nil, fmt.Errorf("read sst footer: %w", err)
@@ -50,7 +48,7 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
 	bloomOffset := binary.LittleEndian.Uint64(footer[8:16])
 
-	// 3. Validate footer offsets.
+	// Offset-i moraju ostati unutar dela fajla pre footera i u očekivanom redosledu.
 	if int64(indexOffset) < 0 || int64(bloomOffset) < 0 {
 		return nil, fmt.Errorf("negative offsets in sst footer: %w", ErrCorruptionDetected)
 	}
@@ -61,7 +59,7 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 		return nil, fmt.Errorf("invalid footer offsets order: %w", ErrCorruptionDetected)
 	}
 
-	// 4. Read BLOOM FILTER bytes (from bloomOffset to start of footer).
+	// Bloom zauzima prostor od bloomOffset-a do početka footera.
 	bloomSize := (size - 16) - int64(bloomOffset)
 	if bloomSize < 0 {
 		return nil, fmt.Errorf("invalid bloom offset in sst: %w", ErrCorruptionDetected)
@@ -75,7 +73,7 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 		return nil, fmt.Errorf("unmarshal sst bloom: %w", err)
 	}
 
-	// 5. Read INDEX BLOCK bytes (from indexOffset to bloomOffset).
+	// Index zauzima prostor od indexOffset-a do bloomOffset-a.
 	indexSize := int64(bloomOffset) - int64(indexOffset)
 	if indexSize < 0 {
 		return nil, fmt.Errorf("invalid index offset in sst: %w", ErrCorruptionDetected)
@@ -88,8 +86,10 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode sst index: %w", err)
 	}
-	if len(index) > 0 { //dodato - Staro ponašanje: reader proverava samo footer opsege, ali bezuslovno prihvata sadržaj index bloka nakon decode-a.
-		if index[0].byteOffset != 0 { //dodato - Novo ponašanje: reader prihvata index samo ako on konzistentno deli data deo SSTable-a na uređene blokove.
+
+	// Indeks mora uredno da deli data deo fajla na rastuće blokove.
+	if len(index) > 0 {
+		if index[0].byteOffset != 0 {
 			return nil, fmt.Errorf(
 				"sst index first block must start at offset 0: %w",
 				ErrCorruptionDetected,
@@ -134,12 +134,9 @@ func OpenSSTableReader(path string) (*SSTableReader, error) {
 	}, nil
 }
 
-// Get searches for key in the SSTable. Returns the entry if found.
-// Returns ErrNotFound if the key is definitely absent (bloom or index miss).
-// Returns ErrCorruptionDetected if a CRC check fails.
+// Get prolazi kroz bloom filter, indeks i samo jedan data blok da pronađe ključ.
 func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
-	// Stage 1: Bloom filter check — free exit for missing keys.
-	// Unit 8: count every bloom probe, and count skips (definite misses).
+	// Bloom miss je definitivan, zato tada ne otvaramo SSTable fajl.
 	if r.metrics != nil {
 		r.metrics.BloomChecksTotal.Add(1)
 	}
@@ -150,14 +147,12 @@ func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 		return sstEntry{}, ErrNotFound
 	}
 
-	// Stage 2: Binary search the index to find the right data block.
+	// Indeks bira poslednji blok čiji je prvi ključ manji ili jednak traženom ključu.
 	blockOffset, blockEnd := r.locateBlock(key)
 	if blockOffset < 0 {
 		return sstEntry{}, ErrNotFound
 	}
 
-	// Stage 3: Read that data block from disk.
-	// Unit 8: count every data block read from disk.
 	f, err := os.Open(r.path)
 	if err != nil {
 		return sstEntry{}, fmt.Errorf("open sst for read: %w", err)
@@ -173,15 +168,12 @@ func (r *SSTableReader) Get(key []byte) (sstEntry, error) {
 		r.metrics.BlockReadsTotal.Add(1)
 	}
 
-	// Stage 4: Linear scan within the block for the key.
+	// Skeniramo samo odabrani blok, ne ceo SSTable fajl.
 	return scanBlock(blockBytes, key)
 }
 
-// AllEntries returns every entry stored in this SSTable in ascending key order.
-//
-// Compaction uses this method to read complete SSTables before merging them.
-// Tombstones are intentionally returned too: a tombstone is a real record that
-// must participate in newest-write-wins merge logic.
+// AllEntries čita sve data blokove po redosledu ključeva.
+// Compaction koristi i tombstone zapise jer učestvuju u newest-write-wins spajanju.
 func (r *SSTableReader) AllEntries() ([]sstEntry, error) {
 	if len(r.index) == 0 {
 		return nil, nil
@@ -235,18 +227,15 @@ func (r *SSTableReader) AllEntries() ([]sstEntry, error) {
 	return out, nil
 }
 
-// Close releases resources held by the reader. It is currently a no-op
-// because the reader opens and closes the underlying file per Get call
-// rather than holding a long-lived descriptor. It exists so call sites
-// (e.g. Version.Close) are forward-compatible if a future change
-// introduces a persistent handle or memory-mapped file.
+// Close trenutno ne radi ništa jer reader ne zadržava otvoren file descriptor.
+// Metoda postoji da Version može jedinstveno da zatvara readere i da API ostane
+// stabilan ako se kasnije uvede persistentni handle ili memory-mapped fajl.
 func (r *SSTableReader) Close() error {
 	return nil
 }
 
-// locateBlock binary-searches the index for the last entry whose firstKey ≤ key.
-// Returns the byte offset of the block start and the byte offset of its end.
-// Returns -1, -1 if no block could contain the key.
+// locateBlock binary search-om bira poslednji indeks entry čiji firstKey nije veći od key-a.
+// Vraća opseg data bloka ili -1, -1 ako nijedan blok ne može sadržati ključ.
 func (r *SSTableReader) locateBlock(key []byte) (start int64, end int64) {
 	if len(r.index) == 0 {
 		return -1, -1
@@ -273,10 +262,7 @@ func (r *SSTableReader) locateBlock(key []byte) (start int64, end int64) {
 	return blockStart, blockEnd
 }
 
-// --- Block scanning ---
-
-// scanBlock linearly reads all entries in a raw block byte slice,
-// returning the entry whose key matches, or ErrNotFound.
+// scanBlock sekvencijalno čita zapise iz jednog data bloka dok ne pronađe ključ.
 func scanBlock(block []byte, key []byte) (sstEntry, error) {
 	r := bufio.NewReader(newByteReader(block))
 	for {
@@ -294,8 +280,8 @@ func scanBlock(block []byte, key []byte) (sstEntry, error) {
 	return sstEntry{}, ErrNotFound
 }
 
-// readSSEntry decodes one entry from a bufio.Reader.
-// Must mirror the exact format written by writeSSEntry in sstable_writer.go.
+// readSSEntry dekodira jedan entry iz data bloka i proverava njegov CRC.
+// Format mora ostati usklađen sa writeSSEntry iz sstable_writer.go.
 func readSSEntry(r *bufio.Reader) (sstEntry, error) {
 	header := make([]byte, 21)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -321,6 +307,7 @@ func readSSEntry(r *bufio.Reader) (sstEntry, error) {
 		return sstEntry{}, fmt.Errorf("read sst entry value: %w", err)
 	}
 
+	// CRC pokriva header bez CRC polja, zatim key i value bajtove.
 	checksumInput := make([]byte, 0, 17+len(key)+len(value))
 	checksumInput = append(checksumInput, header[:17]...)
 	checksumInput = append(checksumInput, key...)
@@ -339,10 +326,8 @@ func readSSEntry(r *bufio.Reader) (sstEntry, error) {
 	}, nil
 }
 
-// --- Index block decoding ---
-
-// decodeIndexBlock parses the raw index block bytes into a slice of sstIndexEntry.
-// Must mirror the format written by writeSSIndexEntry in sstable_writer.go.
+// decodeIndexBlock dekodira index blok u entry-je koje locateBlock koristi za binary search.
+// Format mora ostati usklađen sa writeSSIndexEntry iz sstable_writer.go.
 func decodeIndexBlock(data []byte) ([]sstIndexEntry, error) {
 	var entries []sstIndexEntry
 	pos := 0
@@ -370,19 +355,18 @@ func decodeIndexBlock(data []byte) ([]sstIndexEntry, error) {
 	return entries, nil
 }
 
-// --- byteReader helper ---
-
-// byteReader wraps a []byte so it satisfies io.Reader.
-// Used to feed scanBlock into bufio.NewReader without copying to a temp file.
+// byteReader prilagođava []byte interfejsu io.Reader za parsiranje data bloka u memoriji.
 type byteReader struct {
 	data []byte
 	pos  int
 }
 
+// newByteReader pravi reader koji sekvencijalno čita dati bajt niz.
 func newByteReader(data []byte) *byteReader {
 	return &byteReader{data: data}
 }
 
+// Read kopira sledeći deo data niza i vraća EOF kada nema više bajtova.
 func (b *byteReader) Read(p []byte) (int, error) {
 	if b.pos >= len(b.data) {
 		return 0, io.EOF

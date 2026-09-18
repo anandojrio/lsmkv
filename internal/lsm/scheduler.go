@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// jobKind razlikuje poslove koje scheduler može da izvršava u pozadini.
 type jobKind int
 
 const (
@@ -13,11 +14,12 @@ const (
 	jobCompact
 )
 
+// job je signal worker-u da izvrši odgovarajući maintenance posao.
 type job struct {
 	kind jobKind
 }
 
-// BGStatus is a snapshot of background worker state for CLI/stats.
+// BGStatus je snapshot stanja background worker-a za CLI i Stats prikaz.
 type BGStatus struct {
 	FlushRunning      bool
 	CompactRunning    bool
@@ -31,6 +33,8 @@ type BGStatus struct {
 	CompactionTrigger int
 }
 
+// scheduler pokreće po jednog worker-a za flush i compaction.
+// Odvojeni queue-ovi omogućavaju da flush ima prioritet nad compaction-om.
 type scheduler struct {
 	store *Store
 
@@ -41,6 +45,7 @@ type scheduler struct {
 	stopCh chan struct{}
 	once   sync.Once
 
+	// Atomici omogućavaju čitanje statusa bez blokiranja worker-a.
 	flushRunning   atomic.Bool
 	compactRunning atomic.Bool
 	flushJobs      atomic.Uint64
@@ -49,6 +54,7 @@ type scheduler struct {
 	lastCompactMs  atomic.Int64
 }
 
+// newScheduler pravi queue-ove i odmah pokreće flush i compaction worker-e.
 func newScheduler(store *Store, queueDepth int) *scheduler {
 	if queueDepth <= 0 {
 		queueDepth = 4
@@ -67,6 +73,7 @@ func newScheduler(store *Store, queueDepth int) *scheduler {
 	return s
 }
 
+// runFlushWorker obrađuje zakazane flush poslove dok scheduler ne dobije stop signal.
 func (s *scheduler) runFlushWorker() {
 	defer s.wg.Done()
 
@@ -84,7 +91,8 @@ func (s *scheduler) runFlushWorker() {
 				s.store.recordBackgroundError("flush", err)
 				continue
 			}
-			// After a successful flush, maybe kick auto-compaction.
+
+			// Compaction proveravamo tek nakon uspešnog flush-a novih SSTable-ova.
 			s.maybeEnqueueCompact()
 
 		case <-s.stopCh:
@@ -93,14 +101,15 @@ func (s *scheduler) runFlushWorker() {
 	}
 }
 
+// runCompactWorker obrađuje compaction poslove, ali prvo prepušta prioritet flush-u.
 func (s *scheduler) runCompactWorker() {
 	defer s.wg.Done()
 
 	for {
 		select {
 		case <-s.compactQueue:
-			// Spec priority: flush beats compaction. If immutables are still
-			// waiting, prefer draining them and try compact again later.
+			// Immutable memtable sadrži novije podatke koji još nisu na disku.
+			// Dok postoji, prvo ga flush-ujemo pa compaction pokušavamo kasnije.
 			s.store.mu.RLock()
 			hasImmutables := s.store.immutableCountLocked() > 0
 			s.store.mu.RUnlock()
@@ -128,14 +137,16 @@ func (s *scheduler) runCompactWorker() {
 	}
 }
 
+// enqueueFlush pokušava da zakaže flush bez blokiranja write path-a.
+// Ako je queue pun, naredna rotacija ili eksplicitni ForceFlush će ponovo pokušati.
 func (s *scheduler) enqueueFlush() {
 	select {
 	case s.flushQueue <- job{kind: jobFlush}:
 	default:
-		// Queue full: next rotation or ForceFlush still drains.
 	}
 }
 
+// enqueueCompact pokušava da zakaže compaction bez blokiranja worker-a ili read/write path-a.
 func (s *scheduler) enqueueCompact() {
 	select {
 	case s.compactQueue <- job{kind: jobCompact}:
@@ -143,17 +154,18 @@ func (s *scheduler) enqueueCompact() {
 	}
 }
 
-// maybeEnqueueCompact schedules compaction only when live SST count
-// meets the configured trigger. trigger <= 0 disables auto-compact.
-// Also skips while immutables remain (flush first).
+// maybeEnqueueCompact zakazuje compaction kada broj live SSTable-a dostigne trigger.
+// Auto-compaction je isključena ako je trigger <= 0 ili ako flush još nije završen.
 func (s *scheduler) maybeEnqueueCompact() {
 	if s.store == nil {
 		return
 	}
+
 	trigger := s.store.cfg.L0CompactionTrigger
 	if trigger <= 0 {
 		return
 	}
+
 	s.store.mu.RLock()
 	immutables := s.store.immutableCountLocked()
 	liveSST := s.store.liveSSTCountLocked()
@@ -167,6 +179,7 @@ func (s *scheduler) maybeEnqueueCompact() {
 	}
 }
 
+// status vraća trenutne atomic brojače i stanje queue-ova.
 func (s *scheduler) status() BGStatus {
 	lastErr := ""
 	trigger := 0
@@ -193,6 +206,7 @@ func (s *scheduler) status() BGStatus {
 	}
 }
 
+// stopGraceful šalje signal worker-ima i čeka da se obe goroutine završe.
 func (s *scheduler) stopGraceful() {
 	s.once.Do(func() {
 		close(s.stopCh)
@@ -200,15 +214,18 @@ func (s *scheduler) stopGraceful() {
 	s.wg.Wait()
 }
 
+// stopFast šalje stop signal, ali čeka najviše 200ms da se worker-i završe.
 func (s *scheduler) stopFast() {
 	s.once.Do(func() {
 		close(s.stopCh)
 	})
+
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
 		close(done)
 	}()
+
 	select {
 	case <-done:
 	case <-time.After(200 * time.Millisecond):

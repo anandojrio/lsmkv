@@ -23,6 +23,7 @@ const (
 	defaultVirtualNodes = 32
 )
 
+// main pokreće jedan distribuirani node: lokalni LSM store, gRPC server i cluster runtime.
 func main() {
 	addr := flag.String("addr", "", "gRPC listen address override")
 	configPath := flag.String("config", defaultConfigPath, "path to JSON config file")
@@ -33,6 +34,7 @@ func main() {
 		log.Fatalf("load node config error: %v", err)
 	}
 
+	// --addr omogućava lokalni override bez menjanja JSON konfiguracije.
 	if *addr != "" {
 		cfg.ListenAddr = *addr
 	}
@@ -42,6 +44,7 @@ func main() {
 		log.Fatalf("build runtime error: %v", err)
 	}
 
+	// Svaki node ima svoj DataDir i svoj lokalni LSM store.
 	if err := os.MkdirAll(rt.Config.Storage.DataDir, 0o755); err != nil {
 		log.Fatalf("create data dir error: %v", err)
 	}
@@ -62,6 +65,7 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
+	// Povezujemo protobuf servis sa implementacijom koja zna za store i cluster runtime.
 	lsmkvv1.RegisterKVServiceServer(grpcServer, node.NewServer(store, rt))
 
 	errCh := make(chan error, 1)
@@ -76,6 +80,7 @@ func main() {
 		errCh <- grpcServer.Serve(lis)
 	}()
 
+	// Ctrl+C i SIGTERM pokreću kontrolisano gašenje servera.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -89,6 +94,7 @@ func main() {
 
 		stopped := make(chan struct{})
 		go func() {
+			// GracefulStop prestaje da prima nove RPC pozive i čeka aktivne handlere.
 			grpcServer.GracefulStop()
 			close(stopped)
 		}()
@@ -97,6 +103,7 @@ func main() {
 		case <-stopped:
 			log.Println("gRPC server stopped gracefully")
 		case <-time.After(5 * time.Second):
+			// Ako handler blokira predugo, prekidamo server da proces može da se ugasi.
 			log.Println("graceful stop timed out; forcing stop")
 			grpcServer.Stop()
 		}

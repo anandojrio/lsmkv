@@ -10,11 +10,14 @@ import (
 	"lsmkv/internal/lsm"
 )
 
+// Peer opisuje drugi node u cluster-u i adresu na kojoj njegov gRPC server sluša.
 type Peer struct {
 	NodeID     string `json:"node_id"`
 	ListenAddr string `json:"listen_addr"`
 }
 
+// Config sadrži identitet lokalnog node-a, poznate peer-ove, lokalni storage
+// i pravila za replikaciju i quorum operacije.
 type Config struct {
 	NodeID            string     `json:"node_id"`
 	ListenAddr        string     `json:"listen_addr"`
@@ -25,6 +28,7 @@ type Config struct {
 	ReadQuorum        int        `json:"read_quorum"`
 }
 
+// DefaultConfig vraća podrazumevana podešavanja za lokalni node.
 func DefaultConfig() Config {
 	return Config{
 		NodeID:            "node-1",
@@ -37,6 +41,8 @@ func DefaultConfig() Config {
 	}
 }
 
+// LoadConfig učitava JSON preko default vrednosti, pa zatim validira konačnu konfiguraciju.
+// Prazna ili nepostojeća putanja vraća validnu podrazumevanu konfiguraciju.
 func LoadConfig(path string) (Config, error) {
 	cfg := DefaultConfig()
 
@@ -65,6 +71,7 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, nil
 	}
 
+	// Nepoznata JSON polja odbijamo da typo ne ostane neprimećen u produkcionoj konfiguraciji.
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 
@@ -79,6 +86,8 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+// Validate proverava da lokalni node, peer-ovi, quorum vrednosti i storage konfiguracija
+// imaju smisla pre pokretanja servera.
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.NodeID) == "" {
 		return fmt.Errorf("%w: node_id cannot be empty", lsm.ErrInvalidArgument)
@@ -87,6 +96,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: listen_addr cannot be empty", lsm.ErrInvalidArgument)
 	}
 
+	// Lokalni node je već zauzet, pa peer ne sme imati isti ID ili istu adresu.
 	seenIDs := map[string]struct{}{c.NodeID: {}}
 	seenAddrs := map[string]struct{}{c.ListenAddr: {}}
 
@@ -106,6 +116,7 @@ func (c Config) Validate() error {
 		seenIDs[peer.NodeID] = struct{}{}
 		seenAddrs[peer.ListenAddr] = struct{}{}
 	}
+
 	if c.ReplicationFactor <= 0 {
 		return fmt.Errorf("replication_factor must be > 0")
 	}
@@ -115,6 +126,8 @@ func (c Config) Validate() error {
 	if c.ReadQuorum <= 0 || c.ReadQuorum > c.ReplicationFactor {
 		return fmt.Errorf("read_quorum must be in range 1..replication_factor")
 	}
+
+	// Storage podešavanja se validiraju odvojeno u lsm paketu.
 	if err := c.Storage.Validate(); err != nil {
 		return err
 	}

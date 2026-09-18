@@ -2,24 +2,18 @@ package lsm
 
 import "errors"
 
-// Version is the immutable, in-memory snapshot of "which SSTables currently
-// exist" that a reader consults. It is built once from a loaded Manifest
-// plus the SSTableReader handles that were successfully opened for each
-// table listed there. Readers held here are ordered newest-first, mirroring
-// manifest order, so Get can stop at the first real hit.
+// Version je immutable snapshot trenutno objavljenih SSTable-ova.
+// Reader-i su poređani od najnovije ka najstarijoj tabeli, pa prvi pogodak
+// odgovara pravilu da noviji upis ima prednost nad starijim.
 type Version struct {
 	Epoch uint64
 
-	// SSTables holds one open reader per live table, newest table first.
+	// SSTables sadrži jedan reader za svaku live tabelu, newest-first.
 	SSTables []*SSTableReader
-
-	// Later:
-	// Active     *Memtable
-	// Immutables []*Memtable
 }
 
-// newVersionFromManifest builds a Version from a loaded manifest and the
-// slice of readers already opened for its tables (same order as m.Tables).
+// newVersionFromManifest pravi read view iz učitanog manifesta i već otvorenih reader-a.
+// readers mora biti u istom redosledu kao m.Tables.
 func newVersionFromManifest(m *Manifest, readers []*SSTableReader) *Version {
 	return &Version{
 		Epoch:    m.Epoch,
@@ -27,34 +21,30 @@ func newVersionFromManifest(m *Manifest, readers []*SSTableReader) *Version {
 	}
 }
 
-// Get searches every SSTable held by this Version, newest first, and
-// returns the first entry found. A tombstone entry is returned as-is
-// (the caller decides how to interpret it) so the search can stop as soon
-// as *any* record for the key is found, matching "newest write wins".
-//
-// If no table contains the key, it returns ErrNotFound. If a table read
-// fails for a reason other than "key absent" (e.g. corruption), that error
-// is returned immediately rather than silently continuing to older tables.
-//
-// Unit 8: wires the store metrics pointer into each reader before the call
-// so bloom/block counters are updated transparently.
+// Get pretražuje SSTable-ove redom od najnovijeg ka najstarijem.
+// Tombstone se vraća caller-u jer i on predstavlja najnovije stanje ključa.
 func (v *Version) Get(key []byte, metrics *Metrics) (sstEntry, error) {
 	for _, r := range v.SSTables {
+		// Reader koristi isti Metrics objekat da evidentira bloom probe i block read-ove.
 		r.metrics = metrics
+
 		entry, err := r.Get(key)
 		if err == nil {
 			return entry, nil
 		}
 		if errors.Is(err, ErrNotFound) {
+			// Tabela sigurno nema ključ; nastavljamo na stariju tabelu.
 			continue
 		}
+
+		// I/O i corruption greške ne smeju biti maskirane starijom vrednošću.
 		return sstEntry{}, err
 	}
 	return sstEntry{}, ErrNotFound
 }
 
-// Close closes every SSTable reader held by this Version. Safe to call on
-// a Version with zero tables.
+// Close zatvara sve readere koje ova verzija poseduje.
+// Bezbedno je pozvati ga i kada nema nijedne SSTable tabele.
 func (v *Version) Close() error {
 	for _, r := range v.SSTables {
 		if err := r.Close(); err != nil {
@@ -64,10 +54,8 @@ func (v *Version) Close() error {
 	return nil
 }
 
-// withPublishedFlush returns a new Version with newReader prepended (newest
-// first) and the epoch bumped to newEpoch. The original Version and its
-// readers are left untouched — callers are responsible for closing the old
-// Version's readers list minus the ones still referenced, if ever needed.
+// withPublishedFlush pravi novu verziju sa sveže flush-ovanom tabelom na početku.
+// Originalna verzija ostaje neizmenjena dok store ne objavi novu.
 func (v *Version) withPublishedFlush(newReader *SSTableReader, newEpoch uint64) *Version {
 	tables := make([]*SSTableReader, 0, len(v.SSTables)+1)
 	tables = append(tables, newReader)

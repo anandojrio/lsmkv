@@ -9,11 +9,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// writeReplicaResult predstavlja rezultat upisa na jednu repliku.
 type writeReplicaResult struct {
 	err error
 }
 
+// replicatePut šalje isti Put svim node-ovima iz preference liste i vraća uspeh
+// čim write quorum potvrda bude dostignut.
 func (s *Server) replicatePut(ctx context.Context, key, value []byte) error {
+	// Bez runtime-a server radi kao lokalni single-node store.
 	if s.rt == nil || s.rt.Coordinator == nil {
 		return s.store.Put(key, value)
 	}
@@ -28,6 +32,7 @@ func (s *Server) replicatePut(ctx context.Context, key, value []byte) error {
 		required = 1
 	}
 
+	// Bafer veličine preference liste garantuje da worker-i ne blokiraju pri slanju rezultata.
 	results := make(chan writeReplicaResult, len(prefs))
 
 	var wg sync.WaitGroup
@@ -39,6 +44,7 @@ func (s *Server) replicatePut(ctx context.Context, key, value []byte) error {
 			defer wg.Done()
 
 			if replica.ID == s.rt.Config.NodeID {
+				// Lokalna replika se upisuje direktno, bez gRPC poziva ka samom sebi.
 				if err := s.store.Put(key, value); err != nil {
 					results <- writeReplicaResult{err: err}
 					return
@@ -56,6 +62,7 @@ func (s *Server) replicatePut(ctx context.Context, key, value []byte) error {
 			}
 			defer func() { _ = client.Close() }()
 
+			// Forwarded=true sprečava repliku da zahtev ponovo rutira ili replicira.
 			if err := client.ForwardPut(ctx, key, value); err != nil {
 				results <- writeReplicaResult{err: err}
 				return
@@ -92,6 +99,7 @@ func (s *Server) replicatePut(ctx context.Context, key, value []byte) error {
 			}
 
 			if res.err != nil {
+				// Čuvamo prvu grešku kao koristan uzrok ako quorum na kraju ne uspe.
 				if firstErr == nil {
 					firstErr = res.err
 				}
@@ -99,6 +107,7 @@ func (s *Server) replicatePut(ctx context.Context, key, value []byte) error {
 			}
 
 			success++
+			// Odgovor se vraća čim imamo dovoljno potvrda; ne čekamo sporije replike.
 			if success >= required {
 				return nil
 			}

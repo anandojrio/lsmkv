@@ -13,13 +13,13 @@ import (
 const (
 	walDirectoryName = "wal"
 
-	// Segment header:
-	// magic (4 bytes) + version (1 byte) + reserved (3 bytes).
-	walSegmentMagic      uint32 = 0x4C534D57 // bytes: "WMSL" on disk in little-endian; identity only
+	// Header segmenta: magic (4 bajta) + verzija (1 bajt) + reserved (3 bajta).
+	walSegmentMagic      uint32 = 0x4C534D57
 	walSegmentVersion    byte   = 1
 	walSegmentHeaderSize        = 8
 )
 
+// WAL upravlja append-only segmentima u kojima se čuvaju upisi pre flush-a u SSTable.
 type WAL struct {
 	dir          string
 	path         string
@@ -33,20 +33,24 @@ type WAL struct {
 	lastSeqNo    uint64
 }
 
+// walDirectory vraća direktorijum u kom se čuvaju WAL segmenti za dati store.
 func walDirectory(dataDir string) string {
 	return filepath.Join(dataDir, walDirectoryName)
 }
 
+// walSegmentPath pravi determinističko ime segmenta, npr. 000001.wal.
 func walSegmentPath(dir string, id int) string {
 	return filepath.Join(dir, fmt.Sprintf("%06d.wal", id))
 }
 
+// OpenWAL otvara poslednji postojeći segment ili kreira prvi segment ako WAL ne postoji.
 func OpenWAL(cfg Config) (*WAL, error) {
 	dir := walDirectory(cfg.DataDir)
-	if cfg.WALFsyncEveryN < 0 { //dodato: ranije je OpenWAL mogao da prihvati besmislen WALSegmentRollBytes, i negativan WALFsyncEveryN, sada to odmah odbija sa jasnom greškom.
+	if cfg.WALFsyncEveryN < 0 {
 		return nil, fmt.Errorf("%w: wal fsync interval must be >= 0", ErrInvalidArgument)
 	}
 
+	// Segment mora imati mesta makar za header i najmanje jedan zapis.
 	if cfg.WALSegmentRollBytes <= walSegmentHeaderSize {
 		return nil, fmt.Errorf(
 			"%w: wal segment roll bytes must be > %d",
@@ -76,6 +80,7 @@ func OpenWAL(cfg Config) (*WAL, error) {
 		return wal, nil
 	}
 
+	// Nastavljamo append samo u najnoviji segment; stariji su read-only istorija.
 	if err := wal.openExistingSegment(ids[len(ids)-1]); err != nil {
 		return nil, err
 	}
@@ -83,9 +88,11 @@ func OpenWAL(cfg Config) (*WAL, error) {
 	return wal, nil
 }
 
+// openNewSegment kreira segment, trajno upisuje header i postavlja ga kao aktivni.
 func (w *WAL) openNewSegment(id int) error {
 	path := walSegmentPath(w.dir, id)
 
+	// O_EXCL sprečava slučajno pregazivanje već postojećeg WAL segmenta.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		return fmt.Errorf("create wal segment %s: %w", path, err)
@@ -100,6 +107,7 @@ func (w *WAL) openNewSegment(id int) error {
 		return fmt.Errorf("write wal segment header: %w", err)
 	}
 
+	// Novi segment nije validan za recovery dok njegov header ne bude na disku.
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("sync wal segment header: %w", err)
@@ -115,6 +123,7 @@ func (w *WAL) openNewSegment(id int) error {
 	return nil
 }
 
+// openExistingSegment proverava header poslednjeg segmenta i otvara ga za append.
 func (w *WAL) openExistingSegment(id int) error {
 	path := walSegmentPath(w.dir, id)
 
@@ -134,7 +143,8 @@ func (w *WAL) openExistingSegment(id int) error {
 		return fmt.Errorf("%w: wal segment %s is smaller than header", ErrCorruptionDetected, path)
 	}
 
-	header := make([]byte, walSegmentHeaderSize) //dodato:Zamenili smo minimalnu proveru “fajl je dovoljno velik” sa pravom proverom identiteta i verzije segmenta.(Sada startup odmah staje ako aktivni segment nije validan)
+	// Provera magic-a i verzije sprečava rad nad pogrešnim ili nepodržanim formatom.
+	header := make([]byte, walSegmentHeaderSize)
 	if _, err := file.ReadAt(header, 0); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("read wal segment header: %w", err)
@@ -165,6 +175,7 @@ func (w *WAL) openExistingSegment(id int) error {
 	return nil
 }
 
+// Append serijalizuje zapis i dodaje ga na kraj aktivnog WAL segmenta.
 func (w *WAL) Append(record WALRecord) error {
 	if w.file == nil {
 		return ErrStoreClosed
@@ -175,8 +186,7 @@ func (w *WAL) Append(record WALRecord) error {
 		return err
 	}
 
-	// Roll before appending if the current segment already has records and
-	// adding this record would exceed the configured size threshold.
+	// Ne delimo zapis između dva segmenta. Novi segment se otvara pre append-a.
 	if w.bytesWritten > 0 && w.activeSize+int64(len(encoded)) > w.rollBytes {
 		if err := w.roll(); err != nil {
 			return err
@@ -197,6 +207,7 @@ func (w *WAL) Append(record WALRecord) error {
 	w.activeSize += int64(n)
 	w.lastSeqNo = record.SeqNo
 
+	// fsync je skuplji, pa se po konfiguraciji radi nakon svakog N-tog append-a.
 	if w.fsyncEveryN > 0 && w.appendCount%w.fsyncEveryN == 0 {
 		if err := w.file.Sync(); err != nil {
 			return fmt.Errorf("sync wal: %w", err)
@@ -206,11 +217,13 @@ func (w *WAL) Append(record WALRecord) error {
 	return nil
 }
 
+// roll zatvara trenutno aktivni segment nakon sync-a i otvara sledeći segment.
 func (w *WAL) roll() error {
 	if w.file == nil {
 		return ErrStoreClosed
 	}
 
+	// Pre prelaska u novi segment obavezno trajno završavamo prethodni.
 	if err := w.file.Sync(); err != nil {
 		return fmt.Errorf("sync wal before roll: %w", err)
 	}
@@ -228,10 +241,8 @@ func (w *WAL) roll() error {
 	return nil
 }
 
-// Reset is called only after a successful memtable-to-SSTable flush.
-// At that point, all mutations represented in the WAL are already durable
-// in the newly published SSTable and manifest, so all existing WAL segments
-// can be removed safely.
+// Reset se poziva tek nakon uspešnog flush-a iz memtable-a u SSTable i manifest.
+// Tada su svi upisi iz postojećih WAL segmenata trajno pokriveni SSTable-ovima.
 func (w *WAL) Reset() error {
 	if w.file == nil {
 		return ErrStoreClosed
@@ -262,26 +273,32 @@ func (w *WAL) Reset() error {
 	return nil
 }
 
+// Path vraća putanju trenutno aktivnog WAL segmenta.
 func (w *WAL) Path() string {
 	return w.path
 }
 
+// Dir vraća direktorijum u kom se nalaze svi WAL segmenti.
 func (w *WAL) Dir() string {
 	return w.dir
 }
 
+// BytesWritten vraća broj bajtova upisanih u trenutno aktivni segment bez header-a.
 func (w *WAL) BytesWritten() int64 {
 	return w.bytesWritten
 }
 
+// LastSeqNo vraća sequence number poslednjeg append-ovanog zapisa.
 func (w *WAL) LastSeqNo() uint64 {
 	return w.lastSeqNo
 }
 
+// ActiveSegmentID vraća ID segmenta u koji se trenutno append-uju novi zapisi.
 func (w *WAL) ActiveSegmentID() int {
 	return w.activeID
 }
 
+// TotalSegments vraća broj prepoznatih .wal fajlova u WAL direktorijumu.
 func (w *WAL) TotalSegments() int {
 	ids, err := listWALSegmentIDs(w.dir)
 	if err != nil {
@@ -290,6 +307,7 @@ func (w *WAL) TotalSegments() int {
 	return len(ids)
 }
 
+// Close radi završni sync i zatvara aktivni WAL fajl.
 func (w *WAL) Close() error {
 	if w.file == nil {
 		return ErrStoreClosed
@@ -311,6 +329,7 @@ func (w *WAL) Close() error {
 	return nil
 }
 
+// listWALSegmentIDs pronalazi validno numerisane .wal fajlove i sortira ih po ID-u.
 func listWALSegmentIDs(dir string) ([]int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

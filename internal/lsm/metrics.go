@@ -2,33 +2,28 @@ package lsm
 
 import "sync/atomic"
 
-// Metrics holds all engine-level counters. All fields are updated via
-// sync/atomic so they are safe to increment from any goroutine without
-// holding the store mutex.
-//
-// Counters are cumulative since store Open(). They are never reset.
-// Reading a snapshot is done by Metrics.Snapshot().
+// Metrics čuva kumulativne brojače rada engine-a od trenutka kada je store otvoren.
+// Polja su atomic jer ih read path i background worker-i ažuriraju paralelno.
 type Metrics struct {
 	// Write path
 	PutsTotal    atomic.Int64
 	DeletesTotal atomic.Int64
 
-	// Read path — SSTable layer
-	BloomChecksTotal atomic.Int64 // every time Bloom.Has() is called
-	BloomSkipsTotal  atomic.Int64 // every time Bloom says "not present" → disk read skipped
-	BlockReadsTotal  atomic.Int64 // every data block read from disk
+	// Read path na SSTable sloju
+	BloomChecksTotal atomic.Int64 // Broj provera bloom filter-a.
+	BloomSkipsTotal  atomic.Int64 // Bloom miss: čitanje sa diska je preskočeno.
+	BlockReadsTotal  atomic.Int64 // Broj data blokova pročitanih sa diska.
 
-	// Background jobs
-	FlushesTotal    atomic.Int64
+	// Background poslovi
+	FlushesTotal     atomic.Int64
 	CompactionsTotal atomic.Int64
 
-	// Timing (milliseconds, last observed value)
+	// Poslednje izmereno trajanje posla u milisekundama.
 	LastFlushDurationMs   atomic.Int64
 	LastCompactDurationMs atomic.Int64
 }
 
-// MetricsSnapshot is a plain, copyable snapshot of Metrics counters.
-// Use Store.Metrics() to obtain one.
+// MetricsSnapshot je obična kopija trenutnih vrednosti, pogodna za vraćanje iz API-ja.
 type MetricsSnapshot struct {
 	PutsTotal             int64
 	DeletesTotal          int64
@@ -41,10 +36,8 @@ type MetricsSnapshot struct {
 	LastCompactDurationMs int64
 }
 
-// Snapshot returns a consistent point-in-time copy of all counters.
-// Individual fields are each atomic loads; the snapshot is not
-// taken under a single lock, so values are "approximately consistent".
-// This is intentional — metrics are advisory, not transactional.
+// Snapshot čita sve brojače bez Store lock-a.
+// Polja se učitavaju pojedinačno, pa snapshot služi za observability, ne kao transakcioni presek.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
 		PutsTotal:             m.PutsTotal.Load(),

@@ -21,8 +21,16 @@ const (
 	walHeaderSize     = 21
 )
 
+// +------+---------+--------+----------+-------+-----+-------+
+// | op   | seqNo   | keyLen | valueLen | CRC32 | key | value |
+// +------+---------+--------+----------+-------+-----+-------+
+//  1 B      8 B       4 B       4 B       4 B
+
+// Castagnoli CRC32 se koristi za proveru integriteta WAL zapisa.
 var walCRC32Table = crc32.MakeTable(crc32.Castagnoli)
 
+// WALRecord je jedan trajni zapis u write-ahead log-u.
+// Op je Put ili Delete, a SeqNo određuje redosled verzija.
 type WALRecord struct {
 	Op    byte
 	SeqNo uint64
@@ -30,6 +38,7 @@ type WALRecord struct {
 	Value []byte
 }
 
+// Validate proverava da li zapis može bezbedno da se upiše ili primeni pri recovery-ju.
 func (r WALRecord) Validate() error {
 	if r.Op != WALOpPut && r.Op != WALOpDel {
 		return fmt.Errorf("%w: invalid wal op %d", ErrInvalidArgument, r.Op)
@@ -39,6 +48,7 @@ func (r WALRecord) Validate() error {
 		return fmt.Errorf("%w: wal key cannot be empty", ErrInvalidArgument)
 	}
 
+	// Delete nosi samo ključ; samo prisustvo zapisa predstavlja tombstone.
 	if r.Op == WALOpDel && len(r.Value) != 0 {
 		return fmt.Errorf("%w: delete record must not contain value bytes", ErrInvalidArgument)
 	}
@@ -46,6 +56,8 @@ func (r WALRecord) Validate() error {
 	return nil
 }
 
+// Encode pretvara WALRecord u binarni format koji se čuva u WAL segmentu.
+// CRC se računa preko zaglavlja bez checksum polja i preko key/value payload-a.
 func (r WALRecord) Encode() ([]byte, error) {
 	if err := r.Validate(); err != nil {
 		return nil, err
@@ -54,6 +66,7 @@ func (r WALRecord) Encode() ([]byte, error) {
 	keyLen := len(r.Key)
 	valueLen := len(r.Value)
 
+	// Format: op | seqNo | keyLen | valueLen | crc | key | value.
 	buf := make([]byte, walHeaderSize+keyLen+valueLen)
 
 	buf[walOpOffset] = r.Op
@@ -70,6 +83,8 @@ func (r WALRecord) Encode() ([]byte, error) {
 	return buf, nil
 }
 
+// DecodeWALRecord proverava binarni zapis i vraća nezavisnu WALRecord kopiju.
+// Nečitav zapis se tretira kao EOF, a neispravan CRC kao korupcija podataka.
 func DecodeWALRecord(data []byte) (WALRecord, error) {
 	if len(data) < walHeaderSize {
 		return WALRecord{}, io.ErrUnexpectedEOF
@@ -81,6 +96,7 @@ func DecodeWALRecord(data []byte) (WALRecord, error) {
 	valueLen := binary.LittleEndian.Uint32(data[walValueLenOffset:walCRCOffset])
 	wantChecksum := binary.LittleEndian.Uint32(data[walCRCOffset:walHeaderSize])
 
+	// Dužine iz zaglavlja određuju koliko bajtova pripada kompletnom zapisu.
 	totalLen := walHeaderSize + int(keyLen) + int(valueLen)
 	if len(data) < totalLen {
 		return WALRecord{}, io.ErrUnexpectedEOF
@@ -98,6 +114,7 @@ func DecodeWALRecord(data []byte) (WALRecord, error) {
 	valueStart := keyEnd
 	valueEnd := valueStart + int(valueLen)
 
+	// Kopiramo slice-ove da record ne zavisi od bafera koji je korišćen za čitanje.
 	record := WALRecord{
 		Op:    op,
 		SeqNo: seqNo,
@@ -112,6 +129,8 @@ func DecodeWALRecord(data []byte) (WALRecord, error) {
 	return record, nil
 }
 
+// walChecksumInput izostavlja CRC polje iz binarnog zapisa pre računanja provere.
+// Tako Encode i Decode računaju identičan checksum nad svim ostalim bajtovima.
 func walChecksumInput(record []byte) []byte {
 	out := make([]byte, 0, len(record)-4)
 	out = append(out, record[:walCRCOffset]...)

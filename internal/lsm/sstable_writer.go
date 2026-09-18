@@ -9,8 +9,8 @@ import (
 	"sort"
 )
 
-// sstEntry is an in-memory key/value pair destined for an SSTable.
-// tombstone=true means this is a deletion marker.
+// sstEntry predstavlja jedan key/value zapis koji će biti upisan u SSTable.
+// tombstone=true označava brisanje ključa, a ne regularnu vrednost.
 type sstEntry struct {
 	key       []byte
 	value     []byte
@@ -18,25 +18,31 @@ type sstEntry struct {
 	tombstone bool
 }
 
-// sstIndexEntry records the first key of a data block and its byte offset
-// in the file. The reader uses this to binary-search for a target key.
+// +----------------+----------------+----------------+----------------+
+// | DATA BLOCKS    | INDEX BLOCK    | BLOOM FILTER   | FOOTER         |
+// +----------------+----------------+----------------+----------------+
+// ^                ^                ^                ^
+// 0                indexOffset      bloomOffset      kraj fajla
+
+// sstIndexEntry pamti prvi ključ bloka i njegov offset u SSTable fajlu.
+// Reader koristi indeks da binary search-om pronađe blok koji može sadržati ključ.
 type sstIndexEntry struct {
 	firstKey   []byte
 	byteOffset uint64
 }
 
-// SSTableWriter collects entries, sorts them, and flushes them to disk
-// as a complete SSTable file.
+// SSTableWriter prikuplja zapise i od njih pravi jedan kompletan immutable SSTable.
 type SSTableWriter struct {
 	cfg     Config
 	entries []sstEntry
 }
 
+// NewSSTableWriter pravi writer koji koristi podešavanja store-a za blokove i bloom filter.
 func NewSSTableWriter(cfg Config) *SSTableWriter {
 	return &SSTableWriter{cfg: cfg}
 }
 
-// Add stages an entry for writing. Call this for every key in the memtable.
+// Add dodaje zapis za budući flush. Kopije sprečavaju da caller naknadno promeni podatke.
 func (w *SSTableWriter) Add(key, value []byte, seqNo uint64, tombstone bool) {
 	w.entries = append(w.entries, sstEntry{
 		key:       append([]byte(nil), key...),
@@ -46,27 +52,24 @@ func (w *SSTableWriter) Add(key, value []byte, seqNo uint64, tombstone bool) {
 	})
 }
 
-// Flush sorts all staged entries, writes the SSTable to a temp file,
-// then atomically renames it to its final path.
-// It returns the final file path.
+// Flush sortira zapise, pravi SSTable u privremenom fajlu i zatim ga atomically
+// preimenuje na finalnu putanju. Finalni fajl se pojavljuje tek kada je kompletan.
 func (w *SSTableWriter) Flush(path string) error {
-	// 1. Sort entries by key (lexicographic byte order).
+	// SSTable mora biti sortiran po ključu da bi indeks i čitanje po blokovima radili.
 	sort.Slice(w.entries, func(i, j int) bool {
 		ki := string(w.entries[i].key)
 		kj := string(w.entries[j].key)
 		return ki < kj
 	})
 
-	// 2. Write to a temp file first. If we crash mid-write, the .tmp
-	// file is incomplete and the final path never appears — atomicity.
+	// Crash tokom upisa ostavlja samo .tmp fajl, a ne delimično vidljiv SSTable.
 	tmpPath := path + ".tmp"
 	f, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("create sst tmp: %w", err)
 	}
 
-	// bufio.Writer wraps the file with an in-memory buffer so we don't
-	// issue one syscall per field — we batch writes into 64KB chunks.
+	// Bafer smanjuje broj sistemskih poziva dok se pišu data blokovi.
 	bw := bufio.NewWriterSize(f, 65536)
 
 	var (
@@ -76,10 +79,10 @@ func (w *SSTableWriter) Flush(path string) error {
 		blockEntries int
 	)
 
-	// 3. Write DATA BLOCKS: pack entries until blockSize bytes are reached.
+	// Data deo se deli na blokove približno veličine cfg.BlockSize.
 	for i, entry := range w.entries {
-		// Record the start of a new block in the index.
 		if blockEntries == 0 {
+			// Indeks za blok pokazuje na njegov prvi ključ i početak u fajlu.
 			index = append(index, sstIndexEntry{
 				firstKey:   append([]byte(nil), entry.key...),
 				byteOffset: offset,
@@ -96,22 +99,23 @@ func (w *SSTableWriter) Flush(path string) error {
 		offset += uint64(n)
 		blockEntries++
 
-		// When the current block reaches blockSize, close it and start fresh.
+		// Sledeći zapis započinje novi blok kada je trenutni dovoljno velik.
 		if int(offset-blockStart) >= w.cfg.BlockSize {
 			blockEntries = 0
 		}
 	}
 
-	// 4. Flush buffered data block bytes to the underlying file.
+	// Pre prelaska na indeks moramo isprazniti bafer sa data blokovima u fajl.
 	if err := bw.Flush(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("flush sst data: %w", err)
 	}
 
-	indexOffset := offset // remember where the index starts
+	// Offset je granica između data dela i index bloka.
+	indexOffset := offset
 
-	// 5. Write INDEX BLOCK.
+	// Index sadrži dovoljno informacija da reader izabere odgovarajući data blok.
 	ibw := bufio.NewWriter(f)
 	for _, ie := range index {
 		n, err := writeSSIndexEntry(ibw, ie)
@@ -128,9 +132,10 @@ func (w *SSTableWriter) Flush(path string) error {
 		return fmt.Errorf("flush sst index: %w", err)
 	}
 
-	bloomOffset := offset // remember where the bloom filter starts
+	// Offset je granica između indeksa i bloom filter-a.
+	bloomOffset := offset
 
-	// 6. Write BLOOM FILTER.
+	// Bloom filter omogućava reader-u da preskoči tabelu kada ključ sigurno nije u njoj.
 	bloom := buildBloomFilter(w.entries, w.cfg.BloomFalsePositive)
 	bn, err := f.Write(bloom)
 	if err != nil {
@@ -140,7 +145,7 @@ func (w *SSTableWriter) Flush(path string) error {
 	}
 	offset += uint64(bn)
 
-	// 7. Write FOOTER: 8 bytes indexOffset + 8 bytes bloomOffset = 16 bytes.
+	// Footer ima fiksnu veličinu i govori reader-u gde počinju indeks i bloom filter.
 	footer := make([]byte, 16)
 	binary.LittleEndian.PutUint64(footer[0:8], indexOffset)
 	binary.LittleEndian.PutUint64(footer[8:16], bloomOffset)
@@ -150,7 +155,7 @@ func (w *SSTableWriter) Flush(path string) error {
 		return fmt.Errorf("write sst footer: %w", err)
 	}
 
-	// 8. Sync to disk (ensure bytes leave the OS buffer cache).
+	// Sync pre rename-a obezbeđuje da finalni fajl ne pokaže na prazne OS buffere.
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpPath)
@@ -161,7 +166,7 @@ func (w *SSTableWriter) Flush(path string) error {
 		return fmt.Errorf("close sst tmp: %w", err)
 	}
 
-	// 9. Atomic rename: the final path either has the complete file or nothing.
+	// Rename unutar istog fajl sistema objavljuje kompletan SSTable odjednom.
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename sst: %w", err)
@@ -170,35 +175,29 @@ func (w *SSTableWriter) Flush(path string) error {
 	return nil
 }
 
-// --- Entry encoding ---
-
-// writeSSEntry encodes one key/value entry into the writer.
-// Format per entry:
-//
-//	[1 byte flags][8 bytes seqNo][4 bytes keyLen][4 bytes valueLen][4 bytes crc]
-//	[key bytes][value bytes]
-//
-// flags bit 0: tombstone (1=tombstone, 0=live)
+// writeSSEntry zapisuje jedan entry u data blok.
+// Format: flags | seqNo | keyLen | valueLen | crc | key | value.
 func writeSSEntry(w *bufio.Writer, e sstEntry) (int, error) {
 	keyLen := len(e.key)
 	valueLen := len(e.value)
-	headerSize := 1 + 8 + 4 + 4 + 4 // flags+seqNo+keyLen+valueLen+crc
+	const headerSize = 1 + 8 + 4 + 4 + 4
 	total := headerSize + keyLen + valueLen
 
 	buf := make([]byte, total)
 
 	var flags byte
 	if e.tombstone {
+		// Bit 0 označava da zapis predstavlja brisanje.
 		flags = 1
 	}
 	buf[0] = flags
 	binary.LittleEndian.PutUint64(buf[1:9], e.seqNo)
 	binary.LittleEndian.PutUint32(buf[9:13], uint32(keyLen))
 	binary.LittleEndian.PutUint32(buf[13:17], uint32(valueLen))
-	// CRC at buf[17:21] — computed over everything except the CRC field itself
 	copy(buf[headerSize:headerSize+keyLen], e.key)
 	copy(buf[headerSize+keyLen:], e.value)
 
+	// CRC pokriva ceo zapis osim samog CRC polja.
 	checksum := crc32.Checksum(sstChecksumInput(buf), crc32.MakeTable(crc32.Castagnoli))
 	binary.LittleEndian.PutUint32(buf[17:21], checksum)
 
@@ -206,16 +205,16 @@ func writeSSEntry(w *bufio.Writer, e sstEntry) (int, error) {
 	return n, err
 }
 
-// sstChecksumInput returns the bytes to checksum: header (without CRC) + body.
+// sstChecksumInput vraća header bez CRC polja zajedno sa key/value payload-om.
 func sstChecksumInput(buf []byte) []byte {
 	out := make([]byte, 0, len(buf)-4)
-	out = append(out, buf[:17]...) // before CRC
-	out = append(out, buf[21:]...) // after CRC (key+value)
+	out = append(out, buf[:17]...)
+	out = append(out, buf[21:]...)
 	return out
 }
 
-// writeSSIndexEntry encodes one index entry.
-// Format: [4 bytes keyLen][key bytes][8 bytes byteOffset]
+// writeSSIndexEntry zapisuje jedan entry indeksa.
+// Format: keyLen | firstKey | byteOffset.
 func writeSSIndexEntry(w *bufio.Writer, ie sstIndexEntry) (int, error) {
 	keyLen := len(ie.firstKey)
 	buf := make([]byte, 4+keyLen+8)

@@ -5,25 +5,25 @@ import (
 	"math"
 )
 
-// bloomFilter is a simple in-memory bit array Bloom filter.
+// bloomFilter je kompaktna bit mapa za brzu proveru da li ključ možda postoji.
+// Može dati false positive, ali nikada ne sme dati false negative.
 type bloomFilter struct {
-	bits []byte // the bit array, packed 8 bits per byte
-	m    uint64 // total number of bits
-	k    uint64 // number of hash functions
+	bits []byte // Bitovi su spakovani, osam bitova po bajtu.
+	m    uint64 // Ukupan broj bitova u filteru.
+	k    uint64 // Broj hash pozicija koje proveravamo za jedan ključ.
 }
 
-// newBloomFilter creates a filter sized for n expected elements
-// with the given false-positive rate.
+// newBloomFilter pravi filter za očekivani broj ključeva i zadatu false-positive stopu.
 func newBloomFilter(n int, fpRate float64) *bloomFilter {
-	// Optimal bit count formula: m = -n*ln(p) / (ln(2)^2)
+	// Optimalan broj bitova: m = -n * ln(p) / ln(2)^2.
 	m := uint64(math.Ceil(-float64(n) * math.Log(fpRate) / (math.Log(2) * math.Log(2))))
 	if m < 64 {
 		m = 64
 	}
-	// Round up to next multiple of 8 so we pack cleanly into bytes.
+	// Bit mapa mora imati ceo broj bajtova.
 	m = (m + 7) &^ 7
 
-	// Optimal number of hash functions: k = (m/n) * ln(2)
+	// Optimalan broj hash funkcija: k = (m / n) * ln(2).
 	k := uint64(math.Round(float64(m) / float64(n) * math.Log(2)))
 	if k < 1 {
 		k = 1
@@ -36,17 +36,18 @@ func newBloomFilter(n int, fpRate float64) *bloomFilter {
 	}
 }
 
-// add inserts a key into the filter.
+// add postavlja k bitova izračunatih iz ključa.
 func (bf *bloomFilter) add(key []byte) {
 	h1, h2 := bloomHash(key)
 	for i := uint64(0); i < bf.k; i++ {
-		// Double hashing: combine h1 and h2 to get k independent positions.
+		// Double hashing pravi više pozicija bez računanja k nezavisnih hash-eva.
 		pos := (h1 + i*h2) % bf.m
 		bf.bits[pos/8] |= 1 << (pos % 8)
 	}
 }
 
-// mayContain returns false if the key is definitely absent, true if maybe present.
+// mayContain vraća false samo kada ključ sigurno nije dodat u filter.
+// true znači da ključ možda postoji i reader tada mora proveriti SSTable.
 func (bf *bloomFilter) mayContain(key []byte) bool {
 	h1, h2 := bloomHash(key)
 	for i := uint64(0); i < bf.k; i++ {
@@ -58,8 +59,8 @@ func (bf *bloomFilter) mayContain(key []byte) bool {
 	return true
 }
 
-// marshal serializes the filter to bytes for writing to disk.
-// Format: [8 bytes m][8 bytes k][bit array bytes]
+// marshal pretvara metadata i bit mapu u format koji se čuva u SSTable fajlu.
+// Format: m | k | bits.
 func (bf *bloomFilter) marshal() []byte {
 	header := make([]byte, 16)
 	binary.LittleEndian.PutUint64(header[0:8], bf.m)
@@ -68,25 +69,17 @@ func (bf *bloomFilter) marshal() []byte {
 	return out
 }
 
-// unmarshalBloom reconstructs a bloomFilter from its serialized bytes.
-func unmarshalBloom(data []byte) (*bloomFilter, error) { //dodato - Pre: svaki payload sa najmanje 16 bajtova postaje Bloom filter, čak i ako ima nelogične vrednosti.
-	if len(data) < 16 { //dodato - Posle: prihvata se samo Bloom filter čiji:m nije nula,m je deljiv sa 8,k nije nula,broj bit bytes tačno odgovara m / 8.
+// unmarshalBloom učitava bloom filter iz SSTable-a i proverava osnovnu konzistentnost formata.
+func unmarshalBloom(data []byte) (*bloomFilter, error) {
+	if len(data) < 16 {
 		return nil, ErrCorruptionDetected
 	}
 	m := binary.LittleEndian.Uint64(data[0:8])
 	k := binary.LittleEndian.Uint64(data[8:16])
 	bits := append([]byte(nil), data[16:]...)
 
-	if m == 0 {
-		return nil, ErrCorruptionDetected
-	}
-	if m%8 != 0 {
-		return nil, ErrCorruptionDetected
-	}
-	if k == 0 {
-		return nil, ErrCorruptionDetected
-	}
-	if uint64(len(bits)) != m/8 {
+	// m mora opisivati ceo broj bajtova, a payload mora tačno odgovarati toj veličini.
+	if m == 0 || m%8 != 0 || k == 0 || uint64(len(bits)) != m/8 {
 		return nil, ErrCorruptionDetected
 	}
 
@@ -97,12 +90,12 @@ func unmarshalBloom(data []byte) (*bloomFilter, error) { //dodato - Pre: svaki p
 	}, nil
 }
 
-// bloomHash returns two independent 64-bit hashes for double-hashing.
-// Uses FNV-like mixing — simple and fast, no external dependency.
+// bloomHash vraća dve 64-bitne vrednosti za double hashing.
+// Mešanje je jednostavno i lokalno, bez dodatne zavisnosti.
 func bloomHash(key []byte) (uint64, uint64) {
 	var h1, h2 uint64
-	h1 = 14695981039346656037 // FNV offset basis
-	h2 = 1099511628211        // FNV prime as seed for second hash
+	h1 = 14695981039346656037
+	h2 = 1099511628211
 
 	for _, b := range key {
 		h1 ^= uint64(b)
@@ -113,12 +106,12 @@ func bloomHash(key []byte) (uint64, uint64) {
 	return h1, h2
 }
 
-// buildBloomFilter is a helper used by SSTableWriter: add all entry keys
-// and return the serialized bytes ready to write to the SSTable file.
+// buildBloomFilter dodaje ključeve svih SSTable entry-ja i vraća spreman binarni payload.
 func buildBloomFilter(entries []sstEntry, fpRate float64) []byte {
 	if len(entries) == 0 {
 		return newBloomFilter(1, fpRate).marshal()
 	}
+
 	bf := newBloomFilter(len(entries), fpRate)
 	for _, e := range entries {
 		bf.add(e.key)

@@ -8,6 +8,7 @@ import (
 	"os"
 )
 
+// ReplayWAL čita sve WAL segmente redom i vraća zapise potrebne za oporavak memtable-a.
 func ReplayWAL(cfg Config) ([]WALRecord, error) {
 	dir := walDirectory(cfg.DataDir)
 
@@ -18,6 +19,7 @@ func ReplayWAL(cfg Config) ([]WALRecord, error) {
 
 	var records []WALRecord
 
+	// Segmenti se replay-uju po rastućem ID-u da bi se očuvao redosled upisa.
 	for _, id := range ids {
 		path := walSegmentPath(dir, id)
 
@@ -32,6 +34,8 @@ func ReplayWAL(cfg Config) ([]WALRecord, error) {
 	return records, nil
 }
 
+// replayWALSegment vraća sve kompletne i validne zapise iz jednog WAL segmenta.
+// Ako je crash ostavio nepotpun poslednji zapis, taj rep se odbacuje i fajl skraćuje.
 func replayWALSegment(path string) ([]WALRecord, error) {
 	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
@@ -51,6 +55,7 @@ func replayWALSegment(path string) ([]WALRecord, error) {
 		return nil, fmt.Errorf("%w: segment is smaller than header", ErrCorruptionDetected)
 	}
 
+	// Pre podataka proveravamo da fajl zaista koristi očekivani WAL format.
 	header := make([]byte, walSegmentHeaderSize)
 	if _, err := io.ReadFull(file, header); err != nil {
 		return nil, fmt.Errorf("read wal segment header: %w", err)
@@ -69,6 +74,7 @@ func replayWALSegment(path string) ([]WALRecord, error) {
 	}
 
 	var records []WALRecord
+	// offset uvek pokazuje kraj poslednjeg potpuno validnog WAL zapisa.
 	offset := int64(walSegmentHeaderSize)
 
 	for {
@@ -79,14 +85,14 @@ func replayWALSegment(path string) ([]WALRecord, error) {
 		}
 
 		if err != nil {
-			// A crash can leave only an incomplete final record. The safe
-			// response is to discard exactly the incomplete tail and retain
-			// all preceding valid records.
+			// Nagli prekid može ostaviti samo nepotpun poslednji zapis. Prethodni
+			// validni zapisi su bezbedni, pa odbacujemo isključivo nekompletan rep.
 			if errors.Is(err, io.ErrUnexpectedEOF) {
 				if err := file.Truncate(offset); err != nil {
 					return nil, fmt.Errorf("truncate incomplete wal tail: %w", err)
 				}
 
+				// Truncate mora da se sinhronizuje da se isti oštećeni rep ne čita opet.
 				if err := file.Sync(); err != nil {
 					return nil, fmt.Errorf("sync truncated wal segment: %w", err)
 				}
@@ -94,9 +100,8 @@ func replayWALSegment(path string) ([]WALRecord, error) {
 				break
 			}
 
-			// A checksum error or invalid record is corruption, not a normal
-			// end-of-file condition. Do not silently return potentially wrong
-			// data.
+			// Neispravan CRC ili nevalidan record nije normalan kraj fajla.
+			// Ne nastavljamo recovery sa potencijalno pogrešnim podacima.
 			return nil, fmt.Errorf(
 				"decode wal record at byte offset %d: %w",
 				offset,
@@ -111,19 +116,8 @@ func replayWALSegment(path string) ([]WALRecord, error) {
 	return records, nil
 }
 
-// readWALRecord reads exactly one record encoded by WALRecord.Encode.
-//
-// Your record format is:
-//
-//	op        : 1 byte
-//	seqNo     : 8 bytes
-//	keyLen    : 4 bytes
-//	valueLen  : 4 bytes
-//	checksum  : 4 bytes
-//	key       : keyLen bytes
-//	value     : valueLen bytes
-//
-// The fixed first part is walHeaderSize (21 bytes) from wal_record.go.
+// readWALRecord čita tačno jedan zapis u formatu koji pravi WALRecord.Encode.
+// Vraća io.EOF samo kada je fajl čist i nema više bajtova za sledeći zapis.
 func readWALRecord(file *os.File) (WALRecord, int, error) {
 	header := make([]byte, walHeaderSize)
 
@@ -133,6 +127,7 @@ func readWALRecord(file *os.File) (WALRecord, int, error) {
 			return WALRecord{}, 0, io.EOF
 		}
 
+		// Delimično zaglavlje znači da se crash desio tokom upisa poslednjeg zapisa.
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 			return WALRecord{}, 0, io.ErrUnexpectedEOF
 		}
@@ -147,7 +142,7 @@ func readWALRecord(file *os.File) (WALRecord, int, error) {
 		header[walValueLenOffset:walCRCOffset],
 	)
 
-	// Protect recovery from corrupt length fields causing enormous allocation.
+	// Ograničenje sprečava oštećen length field da izazove ogromnu alokaciju.
 	const maxWALRecordBytes = 64 * 1024 * 1024
 
 	payloadLen := uint64(keyLen) + uint64(valueLen)
@@ -165,6 +160,7 @@ func readWALRecord(file *os.File) (WALRecord, int, error) {
 
 	if payloadLen > 0 {
 		if _, err := io.ReadFull(file, recordBytes[walHeaderSize:]); err != nil {
+			// Delimičan key ili value se tretira kao nepotpun poslednji zapis.
 			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 				return WALRecord{}, 0, io.ErrUnexpectedEOF
 			}
@@ -172,6 +168,7 @@ func readWALRecord(file *os.File) (WALRecord, int, error) {
 		}
 	}
 
+	// Decode proverava CRC, granice zapisa i semantičku validnost operacije.
 	record, err := DecodeWALRecord(recordBytes)
 	if err != nil {
 		return WALRecord{}, 0, err

@@ -9,13 +9,16 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// readReplicaResult predstavlja odgovor jedne replike: vrednost, not-found ili grešku.
 type readReplicaResult struct {
 	value []byte
 	found bool
 	err   error
 }
 
+// replicateGet paralelno čita sve replike i vraća rezultat čim read quorum odgovora stigne.
 func (s *Server) replicateGet(ctx context.Context, key []byte) ([]byte, error) {
+	// Bez runtime-a server radi kao lokalni single-node store.
 	if s.rt == nil || s.rt.Coordinator == nil {
 		value, found, err := s.store.Get(key)
 		if err != nil {
@@ -37,6 +40,7 @@ func (s *Server) replicateGet(ctx context.Context, key []byte) ([]byte, error) {
 		required = 1
 	}
 
+	// Svaka replika šalje najviše jedan rezultat, pa worker-i neće blokirati posle quorum return-a.
 	results := make(chan readReplicaResult, len(prefs))
 
 	var wg sync.WaitGroup
@@ -48,6 +52,7 @@ func (s *Server) replicateGet(ctx context.Context, key []byte) ([]byte, error) {
 			defer wg.Done()
 
 			if replica.ID == s.rt.Config.NodeID {
+				// Lokalnu repliku čitamo direktno, bez mrežnog poziva ka istom procesu.
 				value, found, err := s.store.Get(key)
 				if err != nil {
 					results <- readReplicaResult{err: toGRPCError(err)}
@@ -69,6 +74,7 @@ func (s *Server) replicateGet(ctx context.Context, key []byte) ([]byte, error) {
 			}
 			defer func() { _ = client.Close() }()
 
+			// Forwarded read vraća lokalno stanje replike bez novog rutiranja ili quorum-a.
 			value, err := client.ForwardGet(ctx, key)
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
@@ -124,14 +130,17 @@ func (s *Server) replicateGet(ctx context.Context, key []byte) ([]byte, error) {
 			}
 
 			if res.err != nil {
+				// Prva greška daje koristan uzrok kada nema dovoljno dostupnih replika.
 				if firstErr == nil {
 					firstErr = res.err
 				}
 				continue
 			}
 
+			// I NotFound je uspešan odgovor replike i računa se u read quorum.
 			success++
 			if res.found && result == nil {
+				// Trenutna implementacija uzima prvu pronađenu vrednost koja stigne.
 				result = append([]byte(nil), res.value...)
 			}
 
