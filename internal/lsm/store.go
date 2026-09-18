@@ -144,6 +144,11 @@ func (s *Store) Put(key, value []byte) error {
 		return err
 	}
 
+	// Demo-only crash point: WAL record has been appended and fsync-ed according
+	// to the configured WALFsyncEveryN policy, but the volatile memtable has not
+	// been updated yet.
+	runDemoCrashPoint(demoCrashPointAfterWALSyncBeforeMemtable)
+
 	s.mem.Put(key, value, s.seqNo)
 	s.metrics.PutsTotal.Add(1)
 	return s.rotateIfNeededLocked()
@@ -192,6 +197,52 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	return entry.value, true, nil
+}
+
+// GetWithSource returns the same logical result as Get, plus the storage layer
+// that supplied the result. It is intended for read-only diagnostics and demos.
+func (s *Store) GetWithSource(key []byte) ([]byte, bool, string, error) {
+	if len(key) == 0 {
+		return nil, false, "invalid_argument", ErrInvalidArgument
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, false, "closed", ErrStoreClosed
+	}
+
+	if value, tombstone, found := s.mem.Get(key); found {
+		if tombstone {
+			return nil, false, "active_memtable_tombstone", nil
+		}
+		return value, true, "active_memtable", nil
+	}
+
+	// Newer immutable memtables are searched first.
+	for i := len(s.immutables) - 1; i >= 0; i-- {
+		if value, tombstone, found := s.immutables[i].Get(key); found {
+			if tombstone {
+				return nil, false, "immutable_memtable_tombstone", nil
+			}
+			return value, true, "immutable_memtable", nil
+		}
+	}
+
+	entry, err := s.version.Get(key, &s.metrics)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, false, "not_found", nil
+		}
+		return nil, false, "sstable_error", err
+	}
+
+	if entry.tombstone {
+		return nil, false, "sstable_tombstone", nil
+	}
+
+	return entry.value, true, "sstable", nil
 }
 
 // Delete upisuje tombstone umesto da odmah ukloni stare vrednosti sa diska.
@@ -320,6 +371,10 @@ func (s *Store) flushOldestImmutableLocked() error {
 	if err := w.Flush(path); err != nil {
 		return fmt.Errorf("flush immutable to sstable: %w", err)
 	}
+
+	// Demo-only crash point: SSTable file has been fully written, but this table
+	// is not yet present in manifest.json and is therefore not published.
+	runDemoCrashPoint(demoCrashPointAfterFlushSSTBeforeManifest)
 
 	fi, err := os.Stat(path)
 	if err != nil {

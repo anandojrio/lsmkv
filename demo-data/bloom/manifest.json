@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "epoch": 1,
+  "tables": [
+    {
+      "id": 1,
+      "file": "000001.sst",
+      "min_key": "a",
+      "max_key": "z",
+      "min_seq_no": 1,
+      "max_seq_no": 2,
+      "file_size": 111
+    }
+  ]
+}

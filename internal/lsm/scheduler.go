@@ -82,6 +82,11 @@ func (s *scheduler) runFlushWorker() {
 		case <-s.flushQueue:
 			s.flushRunning.Store(true)
 			start := time.Now()
+
+			// Demo-only pause: the memtable is already immutable and the flush job
+			// has been accepted, but disk flush has not started yet.
+			waitDemoPauseBeforeFlush(s.store.cfg.DataDir)
+
 			err := s.store.flushPendingImmutables()
 			s.lastFlushMs.Store(time.Since(start).Milliseconds())
 			s.flushJobs.Add(1)

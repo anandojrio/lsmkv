@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "epoch": 1,
+  "tables": [
+    {
+      "id": 1,
+      "file": "000001.sst",
+      "min_key": "demo:flush-ok",
+      "max_key": "demo:flush-ok",
+      "min_seq_no": 1,
+      "max_seq_no": 1,
+      "file_size": 113
+    }
+  ]
+}

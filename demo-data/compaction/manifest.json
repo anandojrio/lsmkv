@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "epoch": 3,
+  "tables": [
+    {
+      "id": 3,
+      "file": "000003.sst",
+      "min_key": "a",
+      "max_key": "c",
+      "min_seq_no": 2,
+      "max_seq_no": 4,
+      "file_size": 138
+    }
+  ]
+}

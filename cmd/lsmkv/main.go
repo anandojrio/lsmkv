@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"lsmkv/internal/lsm"
 )
@@ -20,6 +23,7 @@ type commandFlags struct {
 	KeySet   bool
 	ValueSet bool
 	Fast     bool
+	CrashAt  string
 }
 
 func main() {
@@ -41,8 +45,40 @@ func main() {
 	case "put":
 		runPut(args)
 
+	case "crash-put":
+		runCrashPut(args)
+
+	case "hard-crash-put":
+		runHardCrashPut(args)
+
+	case "hard-crash-flush":
+		runHardCrashFlush(args)
+
+	case "hard-crash-batch-put":
+		runHardCrashBatchPut(args)
+
+	case "auto-flush-demo":
+		runAutoFlushDemo(args)
+
+	case "immutable-read-demo":
+		runImmutableReadDemo(args)
+	case "bloom-demo":
+		runBloomDemo(args)
+
+	case "bloom-correctness-demo":
+		runBloomCorrectnessDemo(args)
+
+	case "seed-wal-tail":
+		runSeedWALTail(args)
+
+	case "truncate-wal-tail":
+		runTruncateWALTail(args)
+
 	case "get":
 		runGet(args)
+
+	case "get-source":
+		runGetSource(args)
 
 	case "del", "delete":
 		runDelete(args)
@@ -68,9 +104,11 @@ func main() {
 	case "list-sst":
 		runListSST(args)
 
+	case "demo":
+		runDemo(args)
+
 	case "run":
 		run(args)
-
 	default:
 		fatalf("unknown command %q", command)
 	}
@@ -127,6 +165,219 @@ func runPut(args []string) {
 	)
 }
 
+func runCrashPut(args []string) {
+	flags := mustParseFlags(args, true, true)
+
+	if flags.CrashAt != "afterWALSyncBeforeMemtable" {
+		fatalf(
+			"crash-put requires --crash-at afterWALSyncBeforeMemtable",
+		)
+	}
+
+	if err := os.Setenv("LSMKV_DEMO_CRASH_AT", flags.CrashAt); err != nil {
+		fatalf("set crash point: %v", err)
+	}
+
+	fmt.Printf(
+		"Starting controlled crash demo at point=%s\n",
+		flags.CrashAt,
+	)
+	fmt.Println("Expected result: WAL is durable; process stops before memtable update.")
+
+	store := mustOpenStore(flags.Config)
+	defer closeStore(store)
+
+	if err := store.Put([]byte(flags.Key), []byte(flags.Value)); err != nil {
+		fatalf("put error: %v", err)
+	}
+
+	fatalf("ERROR: crash point did not fire")
+}
+
+func runHardCrashPut(args []string) {
+	flags := mustParseFlags(args, true, true)
+
+	store := mustOpenStore(flags.Config)
+
+	if err := store.Put([]byte(flags.Key), []byte(flags.Value)); err != nil {
+		fatalf("put error: %v", err)
+	}
+
+	stats := store.Stats()
+
+	fmt.Printf(
+		"PUT ACKNOWLEDGED: key=%q value=%q seqno=%d\n",
+		flags.Key,
+		flags.Value,
+		stats.LastSeqNo,
+	)
+	fmt.Println("WAL record is fsync-protected according to wal_fsync_every_n.")
+	fmt.Println("SIMULATING HARD CRASH NOW: Store.Close will NOT run.")
+
+	os.Exit(87)
+}
+
+func runHardCrashBatchPut(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	if flags.KeySet || flags.ValueSet {
+		fatalf("hard-crash-batch-put does not use --key or --value")
+	}
+
+	store := mustOpenStore(flags.Config)
+
+	records := []struct {
+		key   string
+		value string
+	}{
+		{key: "k1", value: "v1"},
+		{key: "k2", value: "v2"},
+		{key: "k3", value: "v3"},
+	}
+
+	for _, record := range records {
+		if err := store.Put([]byte(record.key), []byte(record.value)); err != nil {
+			fatalf("put key=%q error: %v", record.key, err)
+		}
+
+		stats := store.Stats()
+		fmt.Printf(
+			"PUT ACKNOWLEDGED: key=%q value=%q seqno=%d\n",
+			record.key,
+			record.value,
+			stats.LastSeqNo,
+		)
+	}
+
+	fmt.Println("All PUT operations were acknowledged.")
+	fmt.Println("SIMULATING HARD CRASH NOW: Store.Close will NOT run.")
+
+	os.Exit(89)
+}
+
+func runSeedWALTail(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	store := mustOpenStore(flags.Config)
+
+	records := []struct {
+		key   string
+		value string
+	}{
+		{key: "key1", value: "val1"},
+		{key: "key2", value: "val2"},
+	}
+
+	for _, record := range records {
+		if err := store.Put([]byte(record.key), []byte(record.value)); err != nil {
+			fatalf("put key=%q error: %v", record.key, err)
+		}
+
+		stats := store.Stats()
+		fmt.Printf(
+			"PUT ACKNOWLEDGED: key=%q value=%q seqno=%d\n",
+			record.key,
+			record.value,
+			stats.LastSeqNo,
+		)
+	}
+
+	fmt.Println("Seed WAL contains two complete fsync-protected records.")
+	fmt.Println("SIMULATING HARD CRASH NOW: Store.Close will NOT run.")
+
+	os.Exit(90)
+}
+
+func runTruncateWALTail(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	cfg, err := lsm.LoadConfig(flags.Config)
+	if err != nil {
+		fatalf("load config error: %v", err)
+	}
+
+	walDir := filepath.Join(cfg.DataDir, "wal")
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		fatalf("read WAL directory: %v", err)
+	}
+
+	var latestName string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".wal") {
+			continue
+		}
+
+		if latestName == "" || entry.Name() > latestName {
+			latestName = entry.Name()
+		}
+	}
+
+	if latestName == "" {
+		fatalf("no WAL segment found in %s", walDir)
+	}
+
+	walPath := filepath.Join(walDir, latestName)
+	info, err := os.Stat(walPath)
+	if err != nil {
+		fatalf("stat WAL segment: %v", err)
+	}
+
+	const bytesToRemove int64 = 4
+	if info.Size() <= 8+bytesToRemove {
+		fatalf(
+			"WAL segment %s is too small to truncate safely: %d bytes",
+			walPath,
+			info.Size(),
+		)
+	}
+
+	newSize := info.Size() - bytesToRemove
+	if err := os.Truncate(walPath, newSize); err != nil {
+		fatalf("truncate WAL tail: %v", err)
+	}
+
+	fmt.Printf(
+		"WAL TAIL TRUNCATED: file=%s old_size=%d new_size=%d removed=%d\n",
+		walPath,
+		info.Size(),
+		newSize,
+		bytesToRemove,
+	)
+}
+
+func runHardCrashFlush(args []string) {
+	flags := mustParseFlags(args, true, true)
+
+	if err := os.Setenv(
+		"LSMKV_DEMO_CRASH_AT",
+		"afterFlushSSTBeforeManifest",
+	); err != nil {
+		fatalf("set crash point: %v", err)
+	}
+
+	store := mustOpenStore(flags.Config)
+
+	if err := store.Put([]byte(flags.Key), []byte(flags.Value)); err != nil {
+		fatalf("put error: %v", err)
+	}
+
+	stats := store.Stats()
+	fmt.Printf(
+		"PUT READY FOR FLUSH: key=%q value=%q seqno=%d\n",
+		flags.Key,
+		flags.Value,
+		stats.LastSeqNo,
+	)
+	fmt.Println("Starting flush. The process will crash after SSTable creation and before manifest save.")
+
+	if err := store.ForceFlush(); err != nil {
+		fatalf("flush error: %v", err)
+	}
+
+	fatalf("ERROR: flush crash point did not fire")
+}
+
 func runGet(args []string) {
 	flags := mustParseFlags(args, true, false)
 
@@ -144,6 +395,362 @@ func runGet(args []string) {
 	}
 
 	fmt.Println(string(value))
+}
+
+func runAutoFlushDemo(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	_, store := loadAndOpenStore(flags.Config)
+	defer closeStore(store)
+
+	records := []struct {
+		key   string
+		value string
+	}{
+		{key: "a", value: "11111111"},
+		{key: "b", value: "22222222"},
+		{key: "c", value: "33333333"},
+	}
+
+	fmt.Println("=== automatic flush demo ===")
+	fmt.Println("The third write exceeds memtable_max_bytes and triggers rotation.")
+	fmt.Println()
+
+	for _, record := range records {
+		if err := store.Put([]byte(record.key), []byte(record.value)); err != nil {
+			fatalf("put key=%q error: %v", record.key, err)
+		}
+
+		stats := store.Stats()
+		bg := store.BGStatus()
+
+		fmt.Printf(
+			"PUT OK: key=%q value=%q seqno=%d active_entries=%d active_bytes=%d immutables=%d sstables=%d flush_queue=%d flush_running=%v\n",
+			record.key,
+			record.value,
+			stats.LastSeqNo,
+			stats.ActiveEntries,
+			stats.ActiveBytes,
+			stats.ImmutablesCount,
+			stats.SSTCount,
+			bg.FlushQueueLen,
+			bg.FlushRunning,
+		)
+	}
+
+	fmt.Println()
+	fmt.Println("Waiting until all background flush jobs finish...")
+
+	for {
+		stats := store.Stats()
+		bg := store.BGStatus()
+
+		if stats.ImmutablesCount == 0 && !bg.FlushRunning && bg.FlushQueueLen == 0 {
+			fmt.Printf(
+				"BACKGROUND FLUSH COMPLETE: active_entries=%d active_bytes=%d immutables=%d sstables=%d\n",
+				stats.ActiveEntries,
+				stats.ActiveBytes,
+				stats.ImmutablesCount,
+				stats.SSTCount,
+			)
+			return
+		}
+
+		fmt.Printf(
+			"WAITING: active_entries=%d immutables=%d sstables=%d flush_queue=%d flush_running=%v\n",
+			stats.ActiveEntries,
+			stats.ImmutablesCount,
+			stats.SSTCount,
+			bg.FlushQueueLen,
+			bg.FlushRunning,
+		)
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func runImmutableReadDemo(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	if err := os.Setenv(
+		"LSMKV_DEMO_PAUSE_AT",
+		"beforeFlushImmutable",
+	); err != nil {
+		fatalf("set demo pause: %v", err)
+	}
+
+	_, store := loadAndOpenStore(flags.Config)
+	defer closeStore(store)
+
+	records := []struct {
+		key   string
+		value string
+	}{
+		{key: "a", value: "11111111"},
+		{key: "b", value: "22222222"},
+		{key: "c", value: "33333333"},
+	}
+
+	fmt.Println("=== immutable memtable read-path demo ===")
+	fmt.Println("The third PUT exceeds the threshold and rotates the active memtable.")
+	fmt.Println("The background worker pauses before writing the immutable memtable to SSTable.")
+
+	for _, record := range records {
+		if err := store.Put([]byte(record.key), []byte(record.value)); err != nil {
+			fatalf("put key=%q error: %v", record.key, err)
+		}
+	}
+
+	stats := store.Stats()
+	bg := store.BGStatus()
+
+	fmt.Printf(
+		"PAUSED STATE: active_entries=%d immutables=%d sstables=%d flush_running=%v\n",
+		stats.ActiveEntries,
+		stats.ImmutablesCount,
+		stats.SSTCount,
+		bg.FlushRunning,
+	)
+
+	value, found, source, err := store.GetWithSource([]byte("a"))
+	if err != nil {
+		fatalf("get source from immutable memtable: %v", err)
+	}
+	if !found {
+		fatalf("key %q was not found while flush is paused", "a")
+	}
+
+	fmt.Printf(
+		"GET WHILE PAUSED: key=%q value=%q source=%s\n",
+		"a",
+		string(value),
+		source,
+	)
+
+	fmt.Println("From a second PowerShell terminal, create resume-flush.signal to continue the background flush.")
+
+	for {
+		stats = store.Stats()
+		bg = store.BGStatus()
+
+		if stats.ImmutablesCount == 0 && !bg.FlushRunning && bg.FlushQueueLen == 0 {
+			fmt.Printf(
+				"BACKGROUND FLUSH COMPLETE: active_entries=%d immutables=%d sstables=%d\n",
+				stats.ActiveEntries,
+				stats.ImmutablesCount,
+				stats.SSTCount,
+			)
+
+			value, found, source, err := store.GetWithSource([]byte("a"))
+			if err != nil {
+				fatalf("get source from sstable: %v", err)
+			}
+			if !found {
+				fatalf("key %q was not found after background flush", "a")
+			}
+
+			fmt.Printf(
+				"GET AFTER FLUSH: key=%q value=%q source=%s\n",
+				"a",
+				string(value),
+				source,
+			)
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func runBloomDemo(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	_, store := loadAndOpenStore(flags.Config)
+	defer closeStore(store)
+
+	records := []struct {
+		key   string
+		value string
+	}{
+		{key: "a", value: "value-a"},
+		{key: "z", value: "value-z"},
+	}
+
+	fmt.Println("=== bloom filter demo ===")
+	fmt.Println("Creating one SSTable with key range [a, z].")
+
+	for _, record := range records {
+		if err := store.Put([]byte(record.key), []byte(record.value)); err != nil {
+			fatalf("put key=%q error: %v", record.key, err)
+		}
+	}
+
+	if err := store.ForceFlush(); err != nil {
+		fatalf("force flush error: %v", err)
+	}
+
+	afterFlush := store.MetricsSnapshot()
+	fmt.Printf(
+		"AFTER FLUSH: bloom_checks=%d bloom_skips=%d block_reads=%d\n",
+		afterFlush.BloomChecksTotal,
+		afterFlush.BloomSkipsTotal,
+		afterFlush.BlockReadsTotal,
+	)
+
+	fmt.Println()
+	fmt.Println(`LOOKUP 1: key="m" is inside [a, z] but was never inserted.`)
+
+	beforeMissing := store.MetricsSnapshot()
+	_, found, source, err := store.GetWithSource([]byte("m"))
+	if err != nil {
+		fatalf("get missing key error: %v", err)
+	}
+	afterMissing := store.MetricsSnapshot()
+
+	fmt.Printf(
+		"MISSING RESULT: found=%v source=%s\n",
+		found,
+		source,
+	)
+	fmt.Printf(
+		"MISSING DELTA: bloom_checks=%+d bloom_skips=%+d block_reads=%+d\n",
+		afterMissing.BloomChecksTotal-beforeMissing.BloomChecksTotal,
+		afterMissing.BloomSkipsTotal-beforeMissing.BloomSkipsTotal,
+		afterMissing.BlockReadsTotal-beforeMissing.BlockReadsTotal,
+	)
+
+	fmt.Println()
+	fmt.Println(`LOOKUP 2: key="a" exists in the SSTable.`)
+
+	beforeExisting := store.MetricsSnapshot()
+	value, found, source, err := store.GetWithSource([]byte("a"))
+	if err != nil {
+		fatalf("get existing key error: %v", err)
+	}
+	afterExisting := store.MetricsSnapshot()
+
+	fmt.Printf(
+		"EXISTING RESULT: found=%v value=%q source=%s\n",
+		found,
+		string(value),
+		source,
+	)
+	fmt.Printf(
+		"EXISTING DELTA: bloom_checks=%+d bloom_skips=%+d block_reads=%+d\n",
+		afterExisting.BloomChecksTotal-beforeExisting.BloomChecksTotal,
+		afterExisting.BloomSkipsTotal-beforeExisting.BloomSkipsTotal,
+		afterExisting.BlockReadsTotal-beforeExisting.BlockReadsTotal,
+	)
+}
+
+func runBloomCorrectnessDemo(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	_, store := loadAndOpenStore(flags.Config)
+	defer closeStore(store)
+
+	const keyCount = 100
+
+	fmt.Println("=== bloom filter correctness demo ===")
+	fmt.Printf("Writing and verifying %d deterministic keys.\n", keyCount)
+
+	for i := 0; i < keyCount; i++ {
+		key := "present-" + strconv.Itoa(i)
+		value := "value-" + strconv.Itoa(i)
+
+		if err := store.Put([]byte(key), []byte(value)); err != nil {
+			fatalf("put key=%q error: %v", key, err)
+		}
+	}
+
+	if err := store.ForceFlush(); err != nil {
+		fatalf("force flush error: %v", err)
+	}
+
+	before := store.MetricsSnapshot()
+
+	for i := 0; i < keyCount; i++ {
+		key := "present-" + strconv.Itoa(i)
+		want := "value-" + strconv.Itoa(i)
+
+		value, found, source, err := store.GetWithSource([]byte(key))
+		if err != nil {
+			fatalf("get key=%q error: %v", key, err)
+		}
+		if !found {
+			fatalf("FALSE NEGATIVE: inserted key=%q was not found", key)
+		}
+		if string(value) != want {
+			fatalf(
+				"WRONG VALUE: key=%q got=%q want=%q",
+				key,
+				string(value),
+				want,
+			)
+		}
+		if source != "sstable" {
+			fatalf(
+				"WRONG SOURCE: key=%q source=%s; expected sstable",
+				key,
+				source,
+			)
+		}
+	}
+
+	after := store.MetricsSnapshot()
+
+	checks := after.BloomChecksTotal - before.BloomChecksTotal
+	skips := after.BloomSkipsTotal - before.BloomSkipsTotal
+	blockReads := after.BlockReadsTotal - before.BlockReadsTotal
+
+	fmt.Println("ALL INSERTED KEYS FOUND")
+	fmt.Printf("verified_keys=%d\n", keyCount)
+	fmt.Printf("bloom_checks=%d\n", checks)
+	fmt.Printf("bloom_skips=%d\n", skips)
+	fmt.Printf("block_reads=%d\n", blockReads)
+
+	if checks != keyCount {
+		fatalf("unexpected bloom check count: got=%d want=%d", checks, keyCount)
+	}
+	if skips != 0 {
+		fatalf(
+			"FALSE NEGATIVE DETECTED: bloom skipped %d inserted key lookups",
+			skips,
+		)
+	}
+	if blockReads < keyCount {
+		fatalf(
+			"unexpected block reads: got=%d, want at least %d",
+			blockReads,
+			keyCount,
+		)
+	}
+
+	fmt.Println("RESULT: no false negatives were observed for inserted keys.")
+}
+
+func runGetSource(args []string) {
+	flags := mustParseFlags(args, true, false)
+
+	store := mustOpenStore(flags.Config)
+	defer closeStore(store)
+
+	value, found, source, err := store.GetWithSource([]byte(flags.Key))
+	if err != nil {
+		fatalf("get-source error: %v", err)
+	}
+
+	if !found {
+		fmt.Printf("NOT FOUND: key=%q source=%s\n", flags.Key, source)
+		return
+	}
+
+	fmt.Printf(
+		"GET OK: key=%q value=%q source=%s\n",
+		flags.Key,
+		string(value),
+		source,
+	)
 }
 
 func runDelete(args []string) {
@@ -304,6 +911,15 @@ func runManifestInfo(args []string) {
 	manifestPath := filepath.Join(cfg.DataDir, "manifest.json")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("=== manifest info ===")
+			fmt.Println("manifest file: not created yet")
+			fmt.Println("sst count: 0")
+			fmt.Println()
+			fmt.Println("(no published sstables)")
+			return
+		}
+
 		fatalf("read manifest error: %v", err)
 	}
 
@@ -416,6 +1032,237 @@ func countSSTEntries(path string) int {
 	return len(entries)
 }
 
+func runDemo(args []string) {
+	flags := mustParseFlags(args, false, false)
+
+	cfg, store := loadAndOpenStore(flags.Config)
+	defer closeStore(store)
+
+	fmt.Println("=== LSMKV interactive lifecycle demo ===")
+	fmt.Printf("data directory: %s\n", cfg.DataDir)
+	fmt.Println("This process keeps one Store instance open.")
+	fmt.Println("Commands: put <key> <value> | get <key> | state | flush | manifest | files | help | exit")
+
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for {
+		fmt.Print("lsmkv-demo> ")
+
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				fatalf("read demo command: %v", err)
+			}
+			fmt.Println()
+			return
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		command := parts[0]
+
+		switch command {
+		case "help":
+			printDemoUsage()
+
+		case "put":
+			if len(parts) != 3 {
+				fmt.Println("usage: put <key> <value>")
+				continue
+			}
+
+			if err := store.Put([]byte(parts[1]), []byte(parts[2])); err != nil {
+				fmt.Printf("PUT ERROR: %v\n", err)
+				continue
+			}
+
+			stats := store.Stats()
+			fmt.Printf(
+				"PUT OK: key=%q value=%q seqno=%d\n",
+				parts[1],
+				parts[2],
+				stats.LastSeqNo,
+			)
+			fmt.Println("Location after PUT: WAL + active memtable")
+
+		case "get":
+			if len(parts) != 2 {
+				fmt.Println("usage: get <key>")
+				continue
+			}
+
+			value, found, err := store.Get([]byte(parts[1]))
+			if err != nil {
+				fmt.Printf("GET ERROR: %v\n", err)
+				continue
+			}
+
+			if !found {
+				fmt.Println("NOT FOUND")
+				continue
+			}
+
+			fmt.Printf("GET OK: key=%q value=%q\n", parts[1], string(value))
+
+		case "state":
+			printDemoState(store)
+
+		case "flush":
+			fmt.Println("FLUSH START: active memtable will rotate to immutable memtable.")
+			fmt.Println("FLUSH STEP: immutable memtable is written to an SSTable.")
+			fmt.Println("FLUSH STEP: manifest is updated before the SSTable becomes visible.")
+
+			if err := store.ForceFlush(); err != nil {
+				fmt.Printf("FLUSH ERROR: %v\n", err)
+				continue
+			}
+
+			stats := store.Stats()
+			fmt.Printf(
+				"FLUSH OK: active_entries=%d immutables=%d sstables=%d\n",
+				stats.ActiveEntries,
+				stats.ImmutablesCount,
+				stats.SSTCount,
+			)
+			fmt.Println("Location after successful flush: SSTable")
+
+		case "manifest":
+			printDemoManifest(cfg)
+
+		case "files":
+			printDemoFiles(cfg)
+
+		case "exit", "quit":
+			fmt.Println("Demo session finished. Closing store gracefully.")
+			return
+
+		default:
+			fmt.Printf("unknown demo command %q; type help\n", command)
+		}
+	}
+}
+
+func printDemoUsage() {
+	fmt.Println("Available demo commands:")
+	fmt.Println("  put <key> <value>  - write one key/value pair")
+	fmt.Println("  get <key>          - read one key")
+	fmt.Println("  state              - show WAL, memtable, immutable, and SSTable counters")
+	fmt.Println("  flush              - synchronously flush the active memtable to an SSTable")
+	fmt.Println("  manifest           - show published SSTable metadata from manifest.json")
+	fmt.Println("  files              - show physical files in the data and WAL directories")
+	fmt.Println("  exit               - gracefully close the Store and end the demo")
+}
+
+func printDemoState(store *lsm.Store) {
+	stats := store.Stats()
+
+	fmt.Println("=== lifecycle state ===")
+	fmt.Printf("last sequence number: %d\n", stats.LastSeqNo)
+	fmt.Println("")
+	fmt.Println("WAL")
+	fmt.Printf("  active segment id:  %d\n", stats.ActiveSegmentID)
+	fmt.Printf("  total segments:     %d\n", stats.TotalWALSegments)
+	fmt.Printf("  data bytes written: %d\n", stats.BytesWritten)
+	fmt.Println("")
+	fmt.Println("MEMTABLE")
+	fmt.Printf("  active entries:     %d\n", stats.ActiveEntries)
+	fmt.Printf("  active bytes:       %d\n", stats.ActiveBytes)
+	fmt.Printf("  immutable count:    %d\n", stats.ImmutablesCount)
+	fmt.Printf("  immutable bytes:    %d\n", stats.ImmutablesBytes)
+	fmt.Println("")
+	fmt.Println("SSTABLES")
+	fmt.Printf("  published count:    %d\n", stats.SSTCount)
+	fmt.Printf("  total bytes:        %d\n", stats.SSTTotalBytes)
+	fmt.Println("=======================")
+}
+
+func printDemoManifest(cfg lsm.Config) {
+	manifestPath := filepath.Join(cfg.DataDir, "manifest.json")
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		fmt.Printf("MANIFEST ERROR: %v\n", err)
+		return
+	}
+
+	var raw struct {
+		Epoch  uint64 `json:"epoch"`
+		Tables []struct {
+			ID       uint64 `json:"id"`
+			File     string `json:"file"`
+			MinKey   string `json:"min_key"`
+			MaxKey   string `json:"max_key"`
+			MinSeqNo uint64 `json:"min_seq_no"`
+			MaxSeqNo uint64 `json:"max_seq_no"`
+			FileSize int64  `json:"file_size"`
+		} `json:"tables"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		fmt.Printf("MANIFEST ERROR: %v\n", err)
+		return
+	}
+
+	fmt.Printf("=== manifest (epoch=%d) ===\n", raw.Epoch)
+
+	if len(raw.Tables) == 0 {
+		fmt.Println("No published SSTables.")
+		return
+	}
+
+	for _, table := range raw.Tables {
+		fmt.Printf(
+			"SSTable: id=%d file=%s key_range=[%q, %q] seq_range=[%d, %d] size=%d bytes\n",
+			table.ID,
+			table.File,
+			table.MinKey,
+			table.MaxKey,
+			table.MinSeqNo,
+			table.MaxSeqNo,
+			table.FileSize,
+		)
+	}
+}
+
+func printDemoFiles(cfg lsm.Config) {
+	fmt.Println("=== physical data files ===")
+	printDirectoryFiles(cfg.DataDir, false)
+
+	fmt.Println("=== physical WAL files ===")
+	printDirectoryFiles(filepath.Join(cfg.DataDir, "wal"), false)
+}
+
+func printDirectoryFiles(dir string, recursive bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Printf("Cannot read %s: %v\n", dir, err)
+		return
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("(empty)")
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			fmt.Printf("[dir]  %s\n", entry.Name())
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			fmt.Printf("[file] %s (metadata error: %v)\n", entry.Name(), err)
+			continue
+		}
+
+		fmt.Printf("[file] %s (%d bytes)\n", entry.Name(), info.Size())
+	}
+}
+
 func run(args []string) {
 	flags := mustParseFlags(args, false, false)
 
@@ -462,9 +1309,17 @@ func mustParseFlags(args []string, requireKey, requireValue bool) commandFlags {
 			flags.Value = strings.TrimPrefix(arg, "--value=")
 			flags.ValueSet = true
 
+		case arg == "--crash-at":
+			flags.CrashAt = nextFlagValue(args, &i, "--crash-at")
+
+		case strings.HasPrefix(arg, "--crash-at="):
+			flags.CrashAt = strings.TrimPrefix(arg, "--crash-at=")
+			if flags.CrashAt == "" {
+				fatalf("--crash-at cannot be empty")
+			}
+
 		case arg == "--fast" || arg == "--fast=true":
 			flags.Fast = true
-
 		case arg == "--fast=false":
 			flags.Fast = false
 
@@ -555,7 +1410,18 @@ func printUsage() {
 	fmt.Println("usage:")
 	fmt.Printf("  %s init [--config path]\n", exe)
 	fmt.Printf("  %s put --key K --value V [--config path]\n", exe)
+	fmt.Printf("  %s crash-put --key K --value V --crash-at afterWALSyncBeforeMemtable [--config path]\n", exe)
+	fmt.Printf("  %s hard-crash-put --key K --value V [--config path]\n", exe)
+	fmt.Printf("  %s hard-crash-batch-put [--config path]\n", exe)
+	fmt.Printf("  %s hard-crash-flush --key K --value V [--config path]\n", exe)
+	fmt.Printf("  %s auto-flush-demo [--config path]\n", exe)
+	fmt.Printf("  %s immutable-read-demo [--config path]\n", exe)
+	fmt.Printf("  %s bloom-demo [--config path]\n", exe)
+	fmt.Printf("  %s bloom-correctness-demo [--config path]\n", exe)
+	fmt.Printf("  %s seed-wal-tail [--config path]\n", exe)
+	fmt.Printf("  %s truncate-wal-tail [--config path]\n", exe)
 	fmt.Printf("  %s get --key K [--config path]\n", exe)
+	fmt.Printf("  %s get-source --key K [--config path]\n", exe)
 	fmt.Printf("  %s del --key K [--config path]\n", exe)
 	fmt.Printf("  %s stats [--config path]\n", exe)
 	fmt.Printf("  %s bg-status [--config path]\n", exe)
@@ -564,6 +1430,7 @@ func printUsage() {
 	fmt.Printf("  %s close [--fast] [--config path]\n", exe)
 	fmt.Printf("  %s manifest-info [--config path]\n", exe)
 	fmt.Printf("  %s list-sst [--config path]\n", exe)
+	fmt.Printf("  %s demo [--config path]\n", exe)
 	fmt.Printf("  %s run [--config path] (legacy smoke test)\n", exe)
 	fmt.Printf("  %s help\n", exe)
 }
